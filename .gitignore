@@ -22,7 +22,6 @@ Thumbs.db
 
 # Credentials and config
 config.ini
-config.ini.example
 credentials.json
 token.json
 
@@ -32,6 +31,3 @@ temp_canvas_downloads/
 
 # Logs
 *.log
-
-# Requirements
-requirements.txt

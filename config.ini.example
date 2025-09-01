@@ -1,0 +1,9 @@
+[CANVAS]
+# Replace with the full URL to your Canvas instance (e.g., https://yourschool.instructure.com)
+API_URL = https://canvas.instructure.com
+# Replace with the API Key you generated in your Canvas settings
+API_KEY = your_canvas_api_key_here
+
+[GOOGLE_DRIVE]
+# The name of the main folder you want to create in Google Drive to store all your course files
+ROOT_FOLDER_NAME = Canvas Sync
