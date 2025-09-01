@@ -1,25 +1,24 @@
-Canvas to Google Drive Scraper & Sync
-======================================
+# Canvas to Storage Scraper & Sync
 
-This script automates the process of downloading all files from your Canvas LMS courses and uploading them to a specified folder in your Google Drive, maintaining the course structure. It's designed to be run periodically to keep your Drive folder in sync with Canvas.
+This script automates the process of downloading all files from your Canvas LMS courses and saving them either to a local directory on your computer or uploading them to a specified folder in your Google Drive, maintaining the course structure. It's designed to be run periodically to keep your storage in sync with Canvas.
 
 ## Features
 
 - Connects to the Canvas LMS API to fetch your courses and files.
-- Connects to the Google Drive API to manage folders and uploads.
-- Creates a root folder in Google Drive (e.g., "Canvas Sync").
+- **Choice of storage**: Save files locally or upload to Google Drive.
+- Creates a root folder/directory for organization.
 - Creates subfolders for each of your Canvas courses.
 - For each Page in a course, creates a dedicated subfolder named after the Page.
-- Uploads the Page's HTML content and any files linked from that Page into the Page's subfolder.
-- Checks for existing files to avoid duplicate uploads, only syncing new files.
-- Cleans up temporary local files after uploading.
+- Saves/uploads the Page's HTML content and any files linked from that Page into the Page's subfolder.
+- Checks for existing files to avoid duplicates, only syncing new files.
+- Cleans up temporary local files after processing.
 
-## Folder Structure in Google Drive
+## Folder Structure
 
-The script organizes your synced files in the following structure:
+The script organizes your synced files in the following structure (works for both local storage and Google Drive):
 
 ```
-Canvas Sync (Root Folder)
+Canvas Sync (Root Folder/Directory)
 ├── Course Name 1
 │   ├── Direct Module Files...
 │   ├── Page Title 1
@@ -33,7 +32,7 @@ Canvas Sync (Root Folder)
 ```
 
 - **Course Folders**: One folder per Canvas course.
-- **Direct Module Files**: Files directly attached to course modules are uploaded here.
+- **Direct Module Files**: Files directly attached to course modules are saved here.
 - **Page Subfolders**: Each course page gets its own subfolder containing the page's HTML and any linked files.
 
 ## Note on How Files Are Found
@@ -75,13 +74,31 @@ pip install requests google-api-python-client google-auth-httplib2 google-auth-o
 1. Log in to your Canvas instance (e.g., https://your-school.instructure.com).
 2. Click on Account in the left-hand navigation bar, then Settings.
 3. Scroll down to the Approved Integrations section and click + New Access Token.
-4. Give the token a Purpose (e.g., "Google Drive Sync Script") and click Generate Token.
+4. Give the token a Purpose (e.g., "Storage Sync Script") and click Generate Token.
 5. Immediately copy the generated token. You will not be able to see it again.
 6. Open the `config.ini.example` file and rename it to `config.ini`.
 7. In `config.ini`, paste the token as the value for `API_KEY`.
 8. Set the `API_URL` to your Canvas instance's URL (e.g., https://your-school.instructure.com).
 
-### Step 4: Configure Google Drive API Access
+### Step 4: Choose Storage Method
+
+In your `config.ini` file, set the `STORAGE_TYPE` to either:
+
+- `local` - Save files to a local directory on your computer
+- `google_drive` - Upload files to Google Drive
+
+For local storage:
+
+- Set `LOCAL_ROOT_DIR` to the directory where you want to save files (e.g., `./canvas_sync`)
+
+For Google Drive storage:
+
+- Set `ROOT_FOLDER_NAME` to the name of the root folder in Google Drive
+- Follow the Google Drive API setup steps below
+
+### Step 5: Configure Google Drive API Access (Only if using Google Drive)
+
+If you chose `google_drive` as your storage type, follow these additional steps:
 
 1. Go to the Google Cloud Console and create a new project (or select an existing one).
 2. Go to APIs & Services -> Library.
@@ -89,16 +106,16 @@ pip install requests google-api-python-client google-auth-httplib2 google-auth-o
 4. Go to APIs & Services -> Credentials.
 5. Click + CREATE CREDENTIALS and choose OAuth client ID.
 6. If prompted, configure the OAuth consent screen.
-	- Choose External for User Type.
-	- Fill in the required fields (App name, User support email, Developer contact information). You can use "Canvas Sync" for the app name. Click Save and Continue through the Scopes and Test Users sections. Finally, click Back to Dashboard.
+   - Choose External for User Type.
+   - Fill in the required fields (App name, User support email, Developer contact information). You can use "Canvas Sync" for the app name. Click Save and Continue through the Scopes and Test Users sections. Finally, click Back to Dashboard.
 7. Now, create the OAuth client ID again.
-	- Select Desktop app for the Application type.
-	- Give it a name (e.g., "Canvas Scraper Credentials").
-	- Click Create.
+   - Select Desktop app for the Application type.
+   - Give it a name (e.g., "Canvas Scraper Credentials").
+   - Click Create.
 8. A window will pop up with your credentials. Click DOWNLOAD JSON.
 9. Rename the downloaded file to `credentials.json` and move it into the same folder as the `main.py` script.
 
-### Step 5: Run the Script
+### Step 6: Run the Script
 
 You are now ready to run the scraper.
 
@@ -110,8 +127,8 @@ Run the script:
 python main.py
 ```
 
-**First-Time Authorization:** The first time you run it, a new tab will open in your web browser asking you to authorize access to your Google Account. Follow the prompts to grant permission. After you approve, a `token.json` file will be created in your project folder. This stores your authorization so you won't have to log in every time.
+**First-Time Google Drive Authorization:** If you chose Google Drive storage, the first time you run it, a new tab will open in your web browser asking you to authorize access to your Google Account. Follow the prompts to grant permission. After you approve, a `token.json` file will be created in your project folder. This stores your authorization so you won't have to log in every time.
 
-The script will now start fetching your courses and syncing new files to your Google Drive.
+The script will now start fetching your courses and syncing new files to your chosen storage location.
 
 Sit back and let it run! You can run this script as often as you like to check for new files.

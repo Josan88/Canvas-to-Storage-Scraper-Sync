@@ -120,7 +120,49 @@ def upload_file_to_drive(service, local_path, drive_filename, folder_id):
         return False
 
 
-# --- Canvas API Functions ---
+# --- Local Storage Functions ---
+
+
+def get_or_create_local_folder(local_root_dir, folder_name, parent_path=None):
+    """Creates a local folder if it doesn't exist. Returns the full path."""
+    if parent_path:
+        folder_path = os.path.join(parent_path, folder_name)
+    else:
+        folder_path = os.path.join(local_root_dir, folder_name)
+
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path)
+        print(f"Created local folder: '{folder_path}'")
+    return folder_path
+
+
+def get_existing_files_in_local_folder(folder_path):
+    """Returns a set of filenames that already exist in a local folder."""
+    if not os.path.exists(folder_path):
+        return set()
+    try:
+        return {
+            f
+            for f in os.listdir(folder_path)
+            if os.path.isfile(os.path.join(folder_path, f))
+        }
+    except OSError as error:
+        print(f"Error reading local folder '{folder_path}': {error}")
+        return set()
+
+
+def save_file_locally(local_path, filename, folder_path):
+    """Moves a file from temp directory to the specified local folder."""
+    if not os.path.exists(local_path):
+        return False
+    try:
+        destination_path = os.path.join(folder_path, filename)
+        shutil.move(local_path, destination_path)
+        print(f"Saved '{filename}' to local storage: '{folder_path}'")
+        return True
+    except OSError as error:
+        print(f"An error occurred saving file locally: {error}")
+        return False
 
 
 def get_paginated_canvas_items(url, headers):
@@ -162,13 +204,15 @@ def download_canvas_file(file_url, local_path, headers):
 
 def process_canvas_file(
     file_info,
-    folder_id,
-    existing_drive_files,
+    folder_path_or_id,
+    existing_files,
     processed_canvas_file_ids,
     canvas_headers,
-    drive_service,
+    storage_type,
+    drive_service=None,
+    local_root_dir=None,
 ):
-    """Helper function to check, download, and upload a single Canvas file."""
+    """Helper function to check, download, and save/upload a single Canvas file."""
     file_id = file_info.get("id")
     filename = file_info.get("display_name")
     file_download_url = file_info.get("url")
@@ -181,21 +225,31 @@ def process_canvas_file(
 
     processed_canvas_file_ids.add(file_id)
 
-    if filename in existing_drive_files:
+    if filename in existing_files:
         return 0
 
     print(f"New file found: '{filename}'")
     local_filepath = os.path.join(DOWNLOAD_DIR, filename)
     if download_canvas_file(file_download_url, local_filepath, canvas_headers):
-        upload_file_to_drive(drive_service, local_filepath, filename, folder_id)
-        os.remove(local_filepath)
-        return 1
+        if storage_type == "google_drive":
+            success = upload_file_to_drive(
+                drive_service, local_filepath, filename, folder_path_or_id
+            )
+        else:  # local storage
+            success = save_file_locally(local_filepath, filename, folder_path_or_id)
+
+        if success:
+            return 1
+        else:
+            # If save/upload failed, remove the downloaded file
+            if os.path.exists(local_filepath):
+                os.remove(local_filepath)
     return 0
 
 
 def main():
     """Main function to run the sync process."""
-    print("--- Starting Canvas to Google Drive Sync ---")
+    print("--- Starting Canvas to Storage Sync ---")
 
     config = configparser.ConfigParser()
     if not os.path.exists(CONFIG_FILE):
@@ -206,20 +260,37 @@ def main():
     try:
         canvas_api_url = config["CANVAS"]["API_URL"]
         canvas_api_key = config["CANVAS"]["API_KEY"]
-        drive_root_folder_name = config["GOOGLE_DRIVE"]["ROOT_FOLDER_NAME"]
+        storage_type = config["STORAGE"]["STORAGE_TYPE"].lower()
+
+        if storage_type == "google_drive":
+            drive_root_folder_name = config["STORAGE"]["ROOT_FOLDER_NAME"]
+        elif storage_type == "local":
+            local_root_dir = config["STORAGE"]["LOCAL_ROOT_DIR"]
+        else:
+            print(
+                f"ERROR: Invalid STORAGE_TYPE '{storage_type}'. Must be 'local' or 'google_drive'"
+            )
+            return
     except KeyError as e:
         print(f"ERROR: Missing config key in {CONFIG_FILE}: {e}")
         return
 
     canvas_headers = {"Authorization": f"Bearer {canvas_api_key}"}
-    drive_service = get_drive_service()
-    if not drive_service:
-        return
 
-    root_folder_id = get_or_create_folder(drive_service, drive_root_folder_name)
-    if not root_folder_id:
-        return
-    print(f"Syncing to Google Drive folder: '{drive_root_folder_name}'")
+    # Initialize storage service
+    if storage_type == "google_drive":
+        drive_service = get_drive_service()
+        if not drive_service:
+            return
+        root_storage_path = get_or_create_folder(drive_service, drive_root_folder_name)
+        if not root_storage_path:
+            return
+        print(f"Syncing to Google Drive folder: '{drive_root_folder_name}'")
+    else:  # local storage
+        root_storage_path = os.path.abspath(local_root_dir)
+        if not os.path.exists(root_storage_path):
+            os.makedirs(root_storage_path)
+        print(f"Syncing to local directory: '{root_storage_path}'")
 
     if os.path.exists(DOWNLOAD_DIR):
         shutil.rmtree(DOWNLOAD_DIR)
@@ -239,15 +310,24 @@ def main():
             continue
 
         print(f"\n--- Processing Course: {course_name} ---")
-        course_folder_id = get_or_create_folder(
-            drive_service, course_name, parent_id=root_folder_id
-        )
-        if not course_folder_id:
-            continue
 
-        existing_drive_files = get_existing_files_in_drive_folder(
-            drive_service, course_folder_id
-        )
+        if storage_type == "google_drive":
+            course_storage_path = get_or_create_folder(
+                drive_service, course_name, parent_id=root_storage_path
+            )
+            if not course_storage_path:
+                continue
+            existing_files = get_existing_files_in_drive_folder(
+                drive_service, course_storage_path
+            )
+        else:  # local storage
+            course_storage_path = get_or_create_local_folder(
+                local_root_dir, course_name
+            )
+            existing_files = get_existing_files_in_local_folder(course_storage_path)
+
+        processed_canvas_file_ids = set()
+        new_items_synced = 0
         processed_canvas_file_ids = set()
         new_items_synced = 0
 
@@ -269,11 +349,13 @@ def main():
                         file_details_resp.raise_for_status()
                         new_items_synced += process_canvas_file(
                             file_details_resp.json(),
-                            course_folder_id,
-                            existing_drive_files,
+                            course_storage_path,
+                            existing_files,
                             processed_canvas_file_ids,
                             canvas_headers,
-                            drive_service,
+                            storage_type,
+                            drive_service if storage_type == "google_drive" else None,
+                            local_root_dir if storage_type == "local" else None,
                         )
 
                     # Case 2: Item is a Page, which we save as an HTML file
@@ -289,14 +371,26 @@ def main():
 
                         safe_page_title = sanitize_filename(page_title)
                         page_folder_name = safe_page_title
-                        page_folder_id = get_or_create_folder(
-                            drive_service, page_folder_name, parent_id=course_folder_id
-                        )
-                        if not page_folder_id:
-                            continue
-                        page_existing_files = get_existing_files_in_drive_folder(
-                            drive_service, page_folder_id
-                        )
+
+                        if storage_type == "google_drive":
+                            page_storage_path = get_or_create_folder(
+                                drive_service,
+                                page_folder_name,
+                                parent_id=course_storage_path,
+                            )
+                            if not page_storage_path:
+                                continue
+                            page_existing_files = get_existing_files_in_drive_folder(
+                                drive_service, page_storage_path
+                            )
+                        else:  # local storage
+                            page_storage_path = get_or_create_local_folder(
+                                course_storage_path, page_folder_name
+                            )
+                            page_existing_files = get_existing_files_in_local_folder(
+                                page_storage_path
+                            )
+
                         html_filename = f"{safe_page_title}.html"
 
                         if html_filename in page_existing_files:
@@ -312,14 +406,22 @@ def main():
                             with open(local_html_path, "w", encoding="utf-8") as f:
                                 f.write(full_html)
 
-                            if upload_file_to_drive(
-                                drive_service,
-                                local_html_path,
-                                html_filename,
-                                page_folder_id,
-                            ):
+                            if storage_type == "google_drive":
+                                success = upload_file_to_drive(
+                                    drive_service,
+                                    local_html_path,
+                                    html_filename,
+                                    page_storage_path,
+                                )
+                            else:  # local storage
+                                success = save_file_locally(
+                                    local_html_path,
+                                    html_filename,
+                                    page_storage_path,
+                                )
+
+                            if success:
                                 new_items_synced += 1
-                            os.remove(local_html_path)
                         except Exception as e:
                             print(
                                 f"\n[ERROR] Could not save page '{page_title}' as HTML: {e}\n"
@@ -341,11 +443,21 @@ def main():
                                 if file_info_resp.ok:
                                     new_items_synced += process_canvas_file(
                                         file_info_resp.json(),
-                                        page_folder_id,
+                                        page_storage_path,
                                         page_existing_files,
                                         processed_canvas_file_ids,
                                         canvas_headers,
-                                        drive_service,
+                                        storage_type,
+                                        (
+                                            drive_service
+                                            if storage_type == "google_drive"
+                                            else None
+                                        ),
+                                        (
+                                            local_root_dir
+                                            if storage_type == "local"
+                                            else None
+                                        ),
                                     )
 
                 except requests.exceptions.RequestException as e:

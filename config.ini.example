@@ -4,6 +4,10 @@ API_URL = https://canvas.instructure.com
 # Replace with the API Key you generated in your Canvas settings
 API_KEY = your_canvas_api_key_here
 
-[GOOGLE_DRIVE]
-# The name of the main folder you want to create in Google Drive to store all your course files
+[STORAGE]
+# Choose storage method: 'local' or 'google_drive'
+STORAGE_TYPE = local
+# For local storage: the root directory where files will be stored
+LOCAL_ROOT_DIR = ./canvas_sync
+# For Google Drive storage: the name of the main folder in Google Drive
 ROOT_FOLDER_NAME = Canvas Sync
