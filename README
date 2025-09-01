@@ -12,14 +12,38 @@ This script automates the process of downloading all files from your Canvas LMS 
 - Connects to the Google Drive API to manage folders and uploads.
 - Creates a root folder in Google Drive (e.g., "Canvas Sync").
 - Creates subfolders for each of your Canvas courses.
+- For each Page in a course, creates a dedicated subfolder named after the Page.
+- Uploads the Page's HTML content and any files linked from that Page into the Page's subfolder.
 - Checks for existing files to avoid duplicate uploads, only syncing new files.
 - Cleans up temporary local files after uploading.
+
+## Folder Structure in Google Drive
+
+The script organizes your synced files in the following structure:
+
+```
+Canvas Sync (Root Folder)
+├── Course Name 1
+│   ├── Direct Module Files...
+│   ├── Page Title 1
+│   │   ├── Page Title 1.html
+│   │   └── Linked Files from Page...
+│   └── Page Title 2
+│       ├── Page Title 2.html
+│       └── Linked Files from Page...
+└── Course Name 2
+    └── ...
+```
+
+- **Course Folders**: One folder per Canvas course.
+- **Direct Module Files**: Files directly attached to course modules are uploaded here.
+- **Page Subfolders**: Each course page gets its own subfolder containing the page's HTML and any linked files.
 
 ## Note on How Files Are Found
 
 Many institutions disable the main "Files" tab in Canvas courses. This prevents the API from directly listing all files.
 
-This script works around that limitation by searching for files that are linked within Course Modules. This will find the vast majority of course materials, but please be aware: If a file is uploaded to the course but not linked in any module, this script will not find it.
+This script works around that limitation by searching for files that are linked within Course Modules and Pages. This will find the vast majority of course materials, including files directly attached to modules and those embedded or linked within course pages. However, please be aware: If a file is uploaded to the course but not linked in any module or page, this script will not find it.
 
 ## Setup Instructions
 

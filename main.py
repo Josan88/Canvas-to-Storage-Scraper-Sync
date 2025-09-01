@@ -162,7 +162,7 @@ def download_canvas_file(file_url, local_path, headers):
 
 def process_canvas_file(
     file_info,
-    course_folder_id,
+    folder_id,
     existing_drive_files,
     processed_canvas_file_ids,
     canvas_headers,
@@ -187,7 +187,7 @@ def process_canvas_file(
     print(f"New file found: '{filename}'")
     local_filepath = os.path.join(DOWNLOAD_DIR, filename)
     if download_canvas_file(file_download_url, local_filepath, canvas_headers):
-        upload_file_to_drive(drive_service, local_filepath, filename, course_folder_id)
+        upload_file_to_drive(drive_service, local_filepath, filename, folder_id)
         os.remove(local_filepath)
         return 1
     return 0
@@ -288,9 +288,18 @@ def main():
                             continue
 
                         safe_page_title = sanitize_filename(page_title)
+                        page_folder_name = safe_page_title
+                        page_folder_id = get_or_create_folder(
+                            drive_service, page_folder_name, parent_id=course_folder_id
+                        )
+                        if not page_folder_id:
+                            continue
+                        page_existing_files = get_existing_files_in_drive_folder(
+                            drive_service, page_folder_id
+                        )
                         html_filename = f"{safe_page_title}.html"
 
-                        if html_filename in existing_drive_files:
+                        if html_filename in page_existing_files:
                             continue
 
                         print(f"New page found: '{page_title}'")
@@ -307,7 +316,7 @@ def main():
                                 drive_service,
                                 local_html_path,
                                 html_filename,
-                                course_folder_id,
+                                page_folder_id,
                             ):
                                 new_items_synced += 1
                             os.remove(local_html_path)
@@ -332,8 +341,8 @@ def main():
                                 if file_info_resp.ok:
                                     new_items_synced += process_canvas_file(
                                         file_info_resp.json(),
-                                        course_folder_id,
-                                        existing_drive_files,
+                                        page_folder_id,
+                                        page_existing_files,
                                         processed_canvas_file_ids,
                                         canvas_headers,
                                         drive_service,
