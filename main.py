@@ -26,6 +26,59 @@ def sanitize_filename(name):
     return re.sub(r'[\\/*?:"<>|]', "", name).strip()
 
 
+def display_courses_and_get_selection(courses):
+    """Displays available courses and gets user selection."""
+    print("\nAvailable courses:")
+    for i, course in enumerate(courses, 1):
+        course_name = course.get("name", "Unnamed")
+        course_code = course.get("course_code", "")
+        print(f"{i}. {course_name} ({course_code})")
+
+    print("\nOptions:")
+    print("- Enter course numbers separated by commas (e.g., 1,3,5)")
+    print("- Enter 'all' to select all courses")
+    print("- Enter 'quit' to exit")
+
+    while True:
+        try:
+            user_input = input("\nSelect courses to sync: ").strip().lower()
+
+            if user_input == "quit":
+                return []
+
+            if user_input == "all":
+                return courses
+
+            # Parse comma-separated numbers
+            selections = []
+            for part in user_input.split(","):
+                part = part.strip()
+                if part.isdigit():
+                    idx = int(part) - 1
+                    if 0 <= idx < len(courses):
+                        selections.append(courses[idx])
+                    else:
+                        print(f"Invalid course number: {int(part)}")
+                        selections = []
+                        break
+                else:
+                    print(f"Invalid input: {part}")
+                    selections = []
+                    break
+
+            if selections:
+                return selections
+            else:
+                print("No valid courses selected. Please try again.")
+
+        except KeyboardInterrupt:
+            print("\nOperation cancelled.")
+            return []
+        except Exception as e:
+            print(f"Error processing selection: {e}")
+            return []
+
+
 # --- Google Drive Service Functions ---
 
 
@@ -303,11 +356,28 @@ def main():
         print("No courses found.")
         return
 
-    for course in courses:
+    # Filter out restricted courses
+    available_courses = [
+        course
+        for course in courses
+        if course.get("id") and not course.get("access_restricted_by_date")
+    ]
+
+    if not available_courses:
+        print("No available courses found (all may be restricted).")
+        return
+
+    # Get user selection
+    selected_courses = display_courses_and_get_selection(available_courses)
+
+    if not selected_courses:
+        print("No courses selected. Exiting.")
+        return
+
+    print(f"\nSelected {len(selected_courses)} course(s) to sync.")
+
+    for course in selected_courses:
         course_name, course_id = course.get("name", "Unnamed"), course.get("id")
-        if not course_id or course.get("access_restricted_by_date"):
-            print(f"\nSkipping course '{course_name}' (Restricted or no ID)")
-            continue
 
         print(f"\n--- Processing Course: {course_name} ---")
 
