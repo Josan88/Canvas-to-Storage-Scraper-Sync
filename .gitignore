@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Credentials and config
+config.ini
+config.ini.example
+credentials.json
+token.json
+
+# Temporary files
+*.tmp
+temp_canvas_downloads/
+
+# Logs
+*.log
+
+# Requirements
+requirements.txt

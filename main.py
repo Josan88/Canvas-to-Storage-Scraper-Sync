@@ -1,0 +1,330 @@
+import os
+import requests
+import configparser
+import shutil
+import re
+from urllib.parse import urlparse
+from bs4 import BeautifulSoup
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
+
+# --- Configuration ---
+SCOPES = ["https://www.googleapis.com/auth/drive"]
+CONFIG_FILE = "config.ini"
+GOOGLE_CREDS_FILE = "credentials.json"
+GOOGLE_TOKEN_FILE = "token.json"
+DOWNLOAD_DIR = "temp_canvas_downloads"
+
+# --- Google Drive Service Functions ---
+
+
+def get_drive_service():
+    """Authenticates with the Google Drive API and returns a service object."""
+    creds = None
+    if os.path.exists(GOOGLE_TOKEN_FILE):
+        creds = Credentials.from_authorized_user_file(GOOGLE_TOKEN_FILE, SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                print(f"Could not refresh token: {e}. Re-authenticating...")
+                os.remove(GOOGLE_TOKEN_FILE)
+                return get_drive_service()
+        else:
+            if not os.path.exists(GOOGLE_CREDS_FILE):
+                print(
+                    f"ERROR: Google credentials file '{GOOGLE_CREDS_FILE}' not found."
+                )
+                return None
+            flow = InstalledAppFlow.from_client_secrets_file(GOOGLE_CREDS_FILE, SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(GOOGLE_TOKEN_FILE, "w") as token:
+            token.write(creds.to_json())
+    try:
+        return build("drive", "v3", credentials=creds)
+    except HttpError as error:
+        print(f"An error occurred building Drive service: {error}")
+        return None
+
+
+def get_or_create_folder(service, folder_name, parent_id=None):
+    """Finds a folder by name. If not found, creates it. Returns the folder ID."""
+    query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder'"
+    query += f" and '{parent_id}' in parents" if parent_id else " and 'root' in parents"
+    try:
+        response = (
+            service.files().list(q=query, spaces="drive", fields="files(id)").execute()
+        )
+        folders = response.get("files", [])
+        if folders:
+            return folders[0].get("id")
+        else:
+            print(f"Creating Google Drive folder: '{folder_name}'...")
+            file_metadata = {
+                "name": folder_name,
+                "mimeType": "application/vnd.google-apps.folder",
+            }
+            if parent_id:
+                file_metadata["parents"] = [parent_id]
+            folder = service.files().create(body=file_metadata, fields="id").execute()
+            return folder.get("id")
+    except HttpError as error:
+        print(f"Error finding/creating folder '{folder_name}': {error}")
+        return None
+
+
+def get_existing_files_in_drive_folder(service, folder_id):
+    """Returns a set of filenames that already exist in a Drive folder."""
+    if not folder_id:
+        return set()
+    try:
+        response = (
+            service.files()
+            .list(q=f"'{folder_id}' in parents", spaces="drive", fields="files(name)")
+            .execute()
+        )
+        return {item["name"] for item in response.get("files", [])}
+    except HttpError as error:
+        print(f"Error fetching files from Drive folder: {error}")
+        return set()
+
+
+def upload_file_to_drive(service, local_path, drive_filename, folder_id):
+    """Uploads a single file to the specified Google Drive folder."""
+    if not os.path.exists(local_path):
+        return False
+    try:
+        print(f"Uploading '{drive_filename}' to Google Drive...")
+        file_metadata = {"name": drive_filename, "parents": [folder_id]}
+        media = MediaFileUpload(local_path)
+        service.files().create(
+            body=file_metadata, media_body=media, fields="id"
+        ).execute()
+        return True
+    except HttpError as error:
+        print(f"An error occurred during file upload: {error}")
+        return False
+
+
+# --- Canvas API Functions ---
+
+
+def get_paginated_canvas_items(url, headers):
+    """Handles Canvas API pagination to retrieve all items from an endpoint."""
+    items, next_url = [], url
+    while next_url:
+        try:
+            response = requests.get(next_url, headers=headers)
+            response.raise_for_status()
+            items.extend(response.json())
+            next_url = None
+            if "Link" in response.headers:
+                links = requests.utils.parse_header_links(response.headers["Link"])
+                next_url = next(
+                    (link["url"] for link in links if link.get("rel") == "next"), None
+                )
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching data from Canvas: {e}")
+            break
+    return items
+
+
+def download_canvas_file(file_url, local_path, headers):
+    """Downloads a file from a Canvas URL to a local path."""
+    try:
+        with requests.get(file_url, headers=headers, stream=True) as r:
+            r.raise_for_status()
+            with open(local_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to download {file_url}: {e}")
+        return False
+
+
+# --- Main Sync Logic ---
+
+
+def process_canvas_file(
+    file_info,
+    course_folder_id,
+    existing_drive_files,
+    processed_canvas_file_ids,
+    canvas_headers,
+    drive_service,
+):
+    """Helper function to check, download, and upload a single Canvas file."""
+    file_id = file_info.get("id")
+    filename = file_info.get("display_name")
+    file_download_url = file_info.get("url")
+
+    if (
+        not all([file_id, filename, file_download_url])
+        or file_id in processed_canvas_file_ids
+    ):
+        return 0
+
+    processed_canvas_file_ids.add(file_id)
+
+    if filename in existing_drive_files:
+        return 0
+
+    print(f"New file found: '{filename}'")
+    local_filepath = os.path.join(DOWNLOAD_DIR, filename)
+    if download_canvas_file(file_download_url, local_filepath, canvas_headers):
+        upload_file_to_drive(drive_service, local_filepath, filename, course_folder_id)
+        os.remove(local_filepath)
+        return 1
+    return 0
+
+
+def main():
+    """Main function to run the sync process."""
+    print("--- Starting Canvas to Google Drive Sync ---")
+
+    config = configparser.ConfigParser()
+    if not os.path.exists(CONFIG_FILE):
+        print(f"ERROR: Config file '{CONFIG_FILE}' not found.")
+        return
+    config.read(CONFIG_FILE)
+
+    try:
+        canvas_api_url = config["CANVAS"]["API_URL"]
+        canvas_api_key = config["CANVAS"]["API_KEY"]
+        drive_root_folder_name = config["GOOGLE_DRIVE"]["ROOT_FOLDER_NAME"]
+    except KeyError as e:
+        print(f"ERROR: Missing config key in {CONFIG_FILE}: {e}")
+        return
+
+    canvas_headers = {"Authorization": f"Bearer {canvas_api_key}"}
+    drive_service = get_drive_service()
+    if not drive_service:
+        return
+
+    root_folder_id = get_or_create_folder(drive_service, drive_root_folder_name)
+    if not root_folder_id:
+        return
+    print(f"Syncing to Google Drive folder: '{drive_root_folder_name}'")
+
+    if os.path.exists(DOWNLOAD_DIR):
+        shutil.rmtree(DOWNLOAD_DIR)
+    os.makedirs(DOWNLOAD_DIR)
+
+    print("\nFetching courses from Canvas...")
+    courses_url = f"{canvas_api_url}/api/v1/courses"
+    courses = get_paginated_canvas_items(courses_url, canvas_headers)
+    if not courses:
+        print("No courses found.")
+        return
+
+    for course in courses:
+        course_name, course_id = course.get("name", "Unnamed"), course.get("id")
+        if not course_id or course.get("access_restricted_by_date"):
+            print(f"\nSkipping course '{course_name}' (Restricted or no ID)")
+            continue
+
+        print(f"\n--- Processing Course: {course_name} ---")
+        course_folder_id = get_or_create_folder(
+            drive_service, course_name, parent_id=root_folder_id
+        )
+        if not course_folder_id:
+            continue
+
+        existing_drive_files = get_existing_files_in_drive_folder(
+            drive_service, course_folder_id
+        )
+        processed_canvas_file_ids = set()
+        new_files_synced = 0
+
+        print("Searching for files in modules and pages...")
+        modules_url = f"{canvas_api_url}/api/v1/courses/{course_id}/modules"
+        modules = get_paginated_canvas_items(modules_url, canvas_headers)
+
+        for module in modules:
+            items_url = f"{canvas_api_url}/api/v1/courses/{course_id}/modules/{module['id']}/items"
+            module_items = get_paginated_canvas_items(items_url, canvas_headers)
+
+            for item in module_items:
+                try:
+                    # Case 1: Item is a direct file link (not in a page)
+                    if item.get("type") == "File":
+                        file_details_resp = requests.get(
+                            item["url"], headers=canvas_headers
+                        )
+                        file_details_resp.raise_for_status()
+                        new_files_synced += process_canvas_file(
+                            file_details_resp.json(),
+                            course_folder_id,
+                            existing_drive_files,
+                            processed_canvas_file_ids,
+                            canvas_headers,
+                            drive_service,
+                        )
+
+                    # Case 2: Item is a Page, which may contain file links
+                    elif item.get("type") == "Page":
+                        page_resp = requests.get(item["url"], headers=canvas_headers)
+                        page_resp.raise_for_status()
+                        page_data = page_resp.json()
+                        html_body = page_data.get("body")
+                        if not html_body:
+                            continue
+
+                        # Create a subfolder for the page inside the course folder
+                        page_title = (
+                            page_data.get("title")
+                            or item.get("title")
+                            or f"Page_{item.get('id')}"
+                        )
+                        page_folder_id = get_or_create_folder(
+                            drive_service, page_title, parent_id=course_folder_id
+                        )
+                        page_drive_files = get_existing_files_in_drive_folder(
+                            drive_service, page_folder_id
+                        )
+
+                        soup = BeautifulSoup(html_body, "html.parser")
+                        for link in soup.find_all("a", href=True):
+                            href = link["href"]
+                            # Look for links pointing to Canvas files
+                            match = re.search(r"/files/(\d+)", href)
+                            if match:
+                                file_id = match.group(1)
+                                file_api_url = (
+                                    f"{canvas_api_url}/api/v1/files/{file_id}"
+                                )
+                                file_info_resp = requests.get(
+                                    file_api_url, headers=canvas_headers
+                                )
+                                file_info_resp.raise_for_status()
+                                new_files_synced += process_canvas_file(
+                                    file_info_resp.json(),
+                                    page_folder_id,
+                                    page_drive_files,
+                                    processed_canvas_file_ids,
+                                    canvas_headers,
+                                    drive_service,
+                                )
+
+                except requests.exceptions.RequestException as e:
+                    print(f"Could not retrieve details for a module item: {e}")
+                except Exception as e:
+                    print(f"An unexpected error occurred processing module item: {e}")
+
+        if new_files_synced == 0:
+            print("All discoverable files for this course are already in sync.")
+        else:
+            print(f"Synced {new_files_synced} new file(s) for '{course_name}'.")
+
+    shutil.rmtree(DOWNLOAD_DIR)
+    print("\n--- Sync Complete ---")
+
+
+if __name__ == "__main__":
+    main()
