@@ -1,6 +1,3 @@
-```mdc
-
-```
 Canvas to Google Drive Scraper & Sync
 ======================================
 
