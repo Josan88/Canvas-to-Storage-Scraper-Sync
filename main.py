@@ -19,6 +19,13 @@ GOOGLE_CREDS_FILE = "credentials.json"
 GOOGLE_TOKEN_FILE = "token.json"
 DOWNLOAD_DIR = "temp_canvas_downloads"
 
+
+# --- Helper Functions ---
+def sanitize_filename(name):
+    """Removes invalid characters from a string to make it a valid filename."""
+    return re.sub(r'[\\/*?:"<>|]', "", name).strip()
+
+
 # --- Google Drive Service Functions ---
 
 
@@ -101,7 +108,9 @@ def upload_file_to_drive(service, local_path, drive_filename, folder_id):
     try:
         print(f"Uploading '{drive_filename}' to Google Drive...")
         file_metadata = {"name": drive_filename, "parents": [folder_id]}
-        media = MediaFileUpload(local_path)
+        # Specify mimetype for HTML files for better browser handling
+        mimetype = "text/html" if drive_filename.lower().endswith(".html") else None
+        media = MediaFileUpload(local_path, mimetype=mimetype)
         service.files().create(
             body=file_metadata, media_body=media, fields="id"
         ).execute()
@@ -240,9 +249,9 @@ def main():
             drive_service, course_folder_id
         )
         processed_canvas_file_ids = set()
-        new_files_synced = 0
+        new_items_synced = 0
 
-        print("Searching for files in modules and pages...")
+        print("Searching for files and pages in modules...")
         modules_url = f"{canvas_api_url}/api/v1/courses/{course_id}/modules"
         modules = get_paginated_canvas_items(modules_url, canvas_headers)
 
@@ -252,13 +261,13 @@ def main():
 
             for item in module_items:
                 try:
-                    # Case 1: Item is a direct file link (not in a page)
+                    # Case 1: Item is a direct file link
                     if item.get("type") == "File":
                         file_details_resp = requests.get(
                             item["url"], headers=canvas_headers
                         )
                         file_details_resp.raise_for_status()
-                        new_files_synced += process_canvas_file(
+                        new_items_synced += process_canvas_file(
                             file_details_resp.json(),
                             course_folder_id,
                             existing_drive_files,
@@ -267,60 +276,80 @@ def main():
                             drive_service,
                         )
 
-                    # Case 2: Item is a Page, which may contain file links
+                    # Case 2: Item is a Page, which we save as an HTML file
                     elif item.get("type") == "Page":
                         page_resp = requests.get(item["url"], headers=canvas_headers)
                         page_resp.raise_for_status()
                         page_data = page_resp.json()
+                        page_title = page_data.get("title")
                         html_body = page_data.get("body")
-                        if not html_body:
+
+                        if not page_title or not html_body:
                             continue
 
-                        # Create a subfolder for the page inside the course folder
-                        page_title = (
-                            page_data.get("title")
-                            or item.get("title")
-                            or f"Page_{item.get('id')}"
-                        )
-                        page_folder_id = get_or_create_folder(
-                            drive_service, page_title, parent_id=course_folder_id
-                        )
-                        page_drive_files = get_existing_files_in_drive_folder(
-                            drive_service, page_folder_id
-                        )
+                        safe_page_title = sanitize_filename(page_title)
+                        html_filename = f"{safe_page_title}.html"
 
+                        if html_filename in existing_drive_files:
+                            continue
+
+                        print(f"New page found: '{page_title}'")
+                        local_html_path = os.path.join(DOWNLOAD_DIR, html_filename)
+                        # Create a full, well-formed HTML document
+                        full_html = f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>{page_title}</title></head><body>{html_body}</body></html>'
+
+                        try:
+                            # Write the HTML content to a local file
+                            with open(local_html_path, "w", encoding="utf-8") as f:
+                                f.write(full_html)
+
+                            if upload_file_to_drive(
+                                drive_service,
+                                local_html_path,
+                                html_filename,
+                                course_folder_id,
+                            ):
+                                new_items_synced += 1
+                            os.remove(local_html_path)
+                        except Exception as e:
+                            print(
+                                f"\n[ERROR] Could not save page '{page_title}' as HTML: {e}\n"
+                            )
+
+                        # Also scan the page for files
                         soup = BeautifulSoup(html_body, "html.parser")
                         for link in soup.find_all("a", href=True):
                             href = link["href"]
-                            # Look for links pointing to Canvas files
                             match = re.search(r"/files/(\d+)", href)
                             if match:
-                                file_id = match.group(1)
+                                file_id_from_page = match.group(1)
                                 file_api_url = (
-                                    f"{canvas_api_url}/api/v1/files/{file_id}"
+                                    f"{canvas_api_url}/api/v1/files/{file_id_from_page}"
                                 )
                                 file_info_resp = requests.get(
                                     file_api_url, headers=canvas_headers
                                 )
-                                file_info_resp.raise_for_status()
-                                new_files_synced += process_canvas_file(
-                                    file_info_resp.json(),
-                                    page_folder_id,
-                                    page_drive_files,
-                                    processed_canvas_file_ids,
-                                    canvas_headers,
-                                    drive_service,
-                                )
+                                if file_info_resp.ok:
+                                    new_items_synced += process_canvas_file(
+                                        file_info_resp.json(),
+                                        course_folder_id,
+                                        existing_drive_files,
+                                        processed_canvas_file_ids,
+                                        canvas_headers,
+                                        drive_service,
+                                    )
 
                 except requests.exceptions.RequestException as e:
                     print(f"Could not retrieve details for a module item: {e}")
                 except Exception as e:
                     print(f"An unexpected error occurred processing module item: {e}")
 
-        if new_files_synced == 0:
-            print("All discoverable files for this course are already in sync.")
+        if new_items_synced == 0:
+            print(
+                "All discoverable files and pages for this course are already in sync."
+            )
         else:
-            print(f"Synced {new_files_synced} new file(s) for '{course_name}'.")
+            print(f"Synced {new_items_synced} new item(s) for '{course_name}'.")
 
     shutil.rmtree(DOWNLOAD_DIR)
     print("\n--- Sync Complete ---")
