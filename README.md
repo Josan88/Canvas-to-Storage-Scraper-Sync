@@ -6,6 +6,7 @@ This script automates the process of downloading all files from your Canvas LMS 
 
 - Connects to the Canvas LMS API to fetch your courses and files.
 - **Choice of storage**: Save files locally or upload to Google Drive.
+- **Remembers last selection**: Automatically saves your course selection and offers to reuse it next time.
 - Creates a root folder/directory for organization.
 - Creates subfolders for each of your Canvas courses.
 - For each Page in a course, creates a dedicated subfolder named after the Page.
@@ -132,3 +133,14 @@ python main.py
 The script will now start fetching your courses and syncing new files to your chosen storage location.
 
 Sit back and let it run! You can run this script as often as you like to check for new files.
+
+### Course Selection Memory
+
+The script remembers your last course selection and offers it as an option for future runs:
+
+- When you select courses, the script automatically saves your choice to `config.ini`.
+- On subsequent runs, courses from your last selection are marked with "(last selected)".
+- You can quickly reuse your last selection by typing "last" when prompted for course selection.
+- If your last selected courses are no longer available, you'll be prompted to select manually.
+
+This feature makes it convenient to sync the same set of courses repeatedly without re-selecting them each time.

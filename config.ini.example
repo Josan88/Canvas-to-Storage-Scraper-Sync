@@ -11,3 +11,7 @@ STORAGE_TYPE = local
 LOCAL_ROOT_DIR = ./canvas_sync
 # For Google Drive storage: the name of the main folder in Google Drive
 ROOT_FOLDER_NAME = Canvas Sync
+
+[LAST_SELECTION]
+# Last selected course IDs (comma-separated)
+COURSE_IDS = 

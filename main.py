@@ -26,17 +26,23 @@ def sanitize_filename(name):
     return re.sub(r'[\\/*?:"<>|]', "", name).strip()
 
 
-def display_courses_and_get_selection(courses):
+def display_courses_and_get_selection(courses, last_course_ids=None):
     """Displays available courses and gets user selection."""
     print("\nAvailable courses:")
     for i, course in enumerate(courses, 1):
         course_name = course.get("name", "Unnamed")
         course_code = course.get("course_code", "")
-        print(f"{i}. {course_name} ({course_code})")
+        marker = (
+            " (last selected)"
+            if last_course_ids and str(course.get("id")) in last_course_ids
+            else ""
+        )
+        print(f"{i}. {course_name} ({course_code}){marker}")
 
     print("\nOptions:")
     print("- Enter course numbers separated by commas (e.g., 1,3,5)")
     print("- Enter 'all' to select all courses")
+    print("- Enter 'last' to use last selection" if last_course_ids else "")
     print("- Enter 'quit' to exit")
 
     while True:
@@ -48,6 +54,23 @@ def display_courses_and_get_selection(courses):
 
             if user_input == "all":
                 return courses
+
+            if user_input == "last" and last_course_ids:
+                # Find courses that match the last selected IDs
+
+                last_courses = [
+                    course
+                    for course in courses
+                    if str(course.get("id")) in last_course_ids
+                ]
+                if last_courses:
+                    print(f"Using last selection: {len(last_courses)} course(s)")
+                    return last_courses
+                else:
+                    print(
+                        "Last selected courses are no longer available. Please select manually."
+                    )
+                    continue
 
             # Parse comma-separated numbers
             selections = []
@@ -77,6 +100,44 @@ def display_courses_and_get_selection(courses):
         except Exception as e:
             print(f"Error processing selection: {e}")
             return []
+
+
+def save_last_selection(selected_courses):
+    """Saves the selected course IDs to config file."""
+    if not selected_courses:
+        return
+
+    config = configparser.ConfigParser()
+    config.read(CONFIG_FILE)
+
+    if not config.has_section("LAST_SELECTION"):
+        config.add_section("LAST_SELECTION")
+
+    course_ids = [
+        str(course.get("id")) for course in selected_courses if course.get("id")
+    ]
+    config.set("LAST_SELECTION", "COURSE_IDS", ",".join(course_ids))
+
+    with open(CONFIG_FILE, "w") as configfile:
+        config.write(configfile)
+
+
+def load_last_selection():
+    """Loads the last selected course IDs from config file."""
+    if not os.path.exists(CONFIG_FILE):
+        return None
+
+    config = configparser.ConfigParser()
+    config.read(CONFIG_FILE)
+
+    if config.has_section("LAST_SELECTION") and config.has_option(
+        "LAST_SELECTION", "COURSE_IDS"
+    ):
+        course_ids_str = config.get("LAST_SELECTION", "COURSE_IDS").strip()
+        if course_ids_str:
+            return set(course_ids_str.split(","))
+
+    return None
 
 
 # --- Google Drive Service Functions ---
@@ -367,12 +428,20 @@ def main():
         print("No available courses found (all may be restricted).")
         return
 
+    # Load last selection
+    last_course_ids = load_last_selection()
+
     # Get user selection
-    selected_courses = display_courses_and_get_selection(available_courses)
+    selected_courses = display_courses_and_get_selection(
+        available_courses, last_course_ids
+    )
 
     if not selected_courses:
         print("No courses selected. Exiting.")
         return
+
+    # Save the selection for next time
+    save_last_selection(selected_courses)
 
     print(f"\nSelected {len(selected_courses)} course(s) to sync.")
 
