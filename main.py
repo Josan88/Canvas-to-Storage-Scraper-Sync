@@ -361,6 +361,119 @@ def process_canvas_file(
     return 0
 
 
+def process_canvas_assignment(
+    assignment_info,
+    assignments_root_path_or_id,
+    processed_canvas_file_ids,
+    canvas_api_url,
+    canvas_headers,
+    storage_type,
+    drive_service=None,
+    local_root_dir=None,
+):
+    """Saves an assignment's details and linked files."""
+    new_items_count = 0
+    assignment_name = assignment_info.get("name")
+    description = assignment_info.get("description")
+    due_at = assignment_info.get("due_at")
+    points_possible = assignment_info.get("points_possible")
+
+    if not assignment_name:
+        return 0
+
+    safe_assignment_name = sanitize_filename(assignment_name)
+    assignment_folder_name = safe_assignment_name
+    html_filename = f"{safe_assignment_name}.html"
+
+    # Create a dedicated subfolder for the assignment
+    if storage_type == "google_drive":
+        assignment_storage_path = get_or_create_folder(
+            drive_service,
+            assignment_folder_name,
+            parent_id=assignments_root_path_or_id,
+        )
+        if not assignment_storage_path:
+            return 0
+        existing_files = get_existing_files_in_drive_folder(
+            drive_service, assignment_storage_path
+        )
+    else:  # local storage
+        assignment_storage_path = get_or_create_local_folder(
+            assignments_root_path_or_id, assignment_folder_name
+        )
+        existing_files = get_existing_files_in_local_folder(assignment_storage_path)
+
+    # Save the main assignment HTML file if it doesn't exist
+    if html_filename not in existing_files:
+        print(f"New assignment found: '{assignment_name}'")
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <title>{assignment_name}</title>
+        </head>
+        <body>
+            <h1>{assignment_name}</h1>
+            <p><b>Due:</b> {due_at or 'N/A'}</p>
+            <p><b>Points:</b> {points_possible or 'N/A'}</p>
+            <hr>
+            {description or ''}
+        </body>
+        </html>
+        """
+        local_html_path = os.path.join(DOWNLOAD_DIR, html_filename)
+        try:
+            with open(local_html_path, "w", encoding="utf-8") as f:
+                f.write(html_content)
+
+            if storage_type == "google_drive":
+                success = upload_file_to_drive(
+                    drive_service,
+                    local_html_path,
+                    html_filename,
+                    assignment_storage_path,
+                )
+            else:
+                success = save_file_locally(
+                    local_html_path,
+                    html_filename,
+                    assignment_storage_path,
+                )
+            if success:
+                new_items_count += 1
+        except Exception as e:
+            print(f"Could not save assignment '{assignment_name}' as HTML: {e}")
+
+    # Scan the assignment description for linked files
+    if description:
+        soup = BeautifulSoup(description, "html.parser")
+        for link in soup.find_all("a", href=True):
+            href = link["href"]
+            match = re.search(r"/files/(\d+)", href)
+            if match:
+                file_id = match.group(1)
+                file_api_url = f"{canvas_api_url}/api/v1/files/{file_id}"
+                try:
+                    file_info_resp = requests.get(file_api_url, headers=canvas_headers)
+                    file_info_resp.raise_for_status()
+                    if file_info_resp.ok:
+                        new_items_count += process_canvas_file(
+                            file_info_resp.json(),
+                            assignment_storage_path,
+                            existing_files,
+                            processed_canvas_file_ids,
+                            canvas_headers,
+                            storage_type,
+                            drive_service,
+                            local_root_dir,
+                        )
+                except requests.RequestException as e:
+                    print(f"Could not fetch file link from assignment: {e}")
+
+    return new_items_count
+
+
 def main():
     """Main function to run the sync process."""
     print("--- Starting Canvas to Storage Sync ---")
@@ -376,6 +489,7 @@ def main():
         canvas_api_key = config["CANVAS"]["API_KEY"]
         storage_type = config["STORAGE"]["STORAGE_TYPE"].lower()
 
+        local_root_dir = None
         if storage_type == "google_drive":
             drive_root_folder_name = config["STORAGE"]["ROOT_FOLDER_NAME"]
         elif storage_type == "local":
@@ -392,6 +506,7 @@ def main():
     canvas_headers = {"Authorization": f"Bearer {canvas_api_key}"}
 
     # Initialize storage service
+    drive_service = None
     if storage_type == "google_drive":
         drive_service = get_drive_service()
         if not drive_service:
@@ -456,20 +571,48 @@ def main():
             )
             if not course_storage_path:
                 continue
-            existing_files = get_existing_files_in_drive_folder(
+            existing_files_in_course_folder = get_existing_files_in_drive_folder(
                 drive_service, course_storage_path
             )
         else:  # local storage
             course_storage_path = get_or_create_local_folder(
                 local_root_dir, course_name
             )
-            existing_files = get_existing_files_in_local_folder(course_storage_path)
+            existing_files_in_course_folder = get_existing_files_in_local_folder(
+                course_storage_path
+            )
 
         processed_canvas_file_ids = set()
         new_items_synced = 0
-        processed_canvas_file_ids = set()
-        new_items_synced = 0
 
+        # --- Process Assignments ---
+        print("Searching for assignments...")
+        assignments_url = f"{canvas_api_url}/api/v1/courses/{course_id}/assignments"
+        assignments = get_paginated_canvas_items(assignments_url, canvas_headers)
+        if assignments:
+            if storage_type == "google_drive":
+                assignments_folder_path = get_or_create_folder(
+                    drive_service, "Assignments", parent_id=course_storage_path
+                )
+            else:
+                assignments_folder_path = get_or_create_local_folder(
+                    course_storage_path, "Assignments"
+                )
+
+            if assignments_folder_path:
+                for assignment in assignments:
+                    new_items_synced += process_canvas_assignment(
+                        assignment,
+                        assignments_folder_path,
+                        processed_canvas_file_ids,
+                        canvas_api_url,
+                        canvas_headers,
+                        storage_type,
+                        drive_service,
+                        local_root_dir,
+                    )
+
+        # --- Process Modules (Files and Pages) ---
         print("Searching for files and pages in modules...")
         modules_url = f"{canvas_api_url}/api/v1/courses/{course_id}/modules"
         modules = get_paginated_canvas_items(modules_url, canvas_headers)
@@ -489,12 +632,12 @@ def main():
                         new_items_synced += process_canvas_file(
                             file_details_resp.json(),
                             course_storage_path,
-                            existing_files,
+                            existing_files_in_course_folder,
                             processed_canvas_file_ids,
                             canvas_headers,
                             storage_type,
-                            drive_service if storage_type == "google_drive" else None,
-                            local_root_dir if storage_type == "local" else None,
+                            drive_service,
+                            local_root_dir,
                         )
 
                     # Case 2: Item is a Page, which we save as an HTML file
@@ -532,39 +675,34 @@ def main():
 
                         html_filename = f"{safe_page_title}.html"
 
-                        if html_filename in page_existing_files:
-                            continue
+                        if html_filename not in page_existing_files:
+                            print(f"New page found: '{page_title}'")
+                            local_html_path = os.path.join(DOWNLOAD_DIR, html_filename)
+                            full_html = f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>{page_title}</title></head><body>{html_body}</body></html>'
 
-                        print(f"New page found: '{page_title}'")
-                        local_html_path = os.path.join(DOWNLOAD_DIR, html_filename)
-                        # Create a full, well-formed HTML document
-                        full_html = f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>{page_title}</title></head><body>{html_body}</body></html>'
+                            try:
+                                with open(local_html_path, "w", encoding="utf-8") as f:
+                                    f.write(full_html)
 
-                        try:
-                            # Write the HTML content to a local file
-                            with open(local_html_path, "w", encoding="utf-8") as f:
-                                f.write(full_html)
-
-                            if storage_type == "google_drive":
-                                success = upload_file_to_drive(
-                                    drive_service,
-                                    local_html_path,
-                                    html_filename,
-                                    page_storage_path,
+                                if storage_type == "google_drive":
+                                    success = upload_file_to_drive(
+                                        drive_service,
+                                        local_html_path,
+                                        html_filename,
+                                        page_storage_path,
+                                    )
+                                else:
+                                    success = save_file_locally(
+                                        local_html_path,
+                                        html_filename,
+                                        page_storage_path,
+                                    )
+                                if success:
+                                    new_items_synced += 1
+                            except Exception as e:
+                                print(
+                                    f"Could not save page '{page_title}' as HTML: {e}"
                                 )
-                            else:  # local storage
-                                success = save_file_locally(
-                                    local_html_path,
-                                    html_filename,
-                                    page_storage_path,
-                                )
-
-                            if success:
-                                new_items_synced += 1
-                        except Exception as e:
-                            print(
-                                f"\n[ERROR] Could not save page '{page_title}' as HTML: {e}\n"
-                            )
 
                         # Also scan the page for files
                         soup = BeautifulSoup(html_body, "html.parser")
@@ -587,16 +725,8 @@ def main():
                                         processed_canvas_file_ids,
                                         canvas_headers,
                                         storage_type,
-                                        (
-                                            drive_service
-                                            if storage_type == "google_drive"
-                                            else None
-                                        ),
-                                        (
-                                            local_root_dir
-                                            if storage_type == "local"
-                                            else None
-                                        ),
+                                        drive_service,
+                                        local_root_dir,
                                     )
 
                 except requests.exceptions.RequestException as e:
@@ -606,7 +736,7 @@ def main():
 
         if new_items_synced == 0:
             print(
-                "All discoverable files and pages for this course are already in sync."
+                "All discoverable files, pages, and assignments for this course are already in sync."
             )
         else:
             print(f"Synced {new_items_synced} new item(s) for '{course_name}'.")
