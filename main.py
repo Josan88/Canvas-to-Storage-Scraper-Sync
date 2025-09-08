@@ -22,6 +22,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
+from datetime import datetime
+import html
 
 # --- Configuration ---
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -35,6 +37,71 @@ DOWNLOAD_DIR = "temp_canvas_downloads"
 def sanitize_filename(name):
     """Removes invalid characters from a string to make it a valid filename."""
     return re.sub(r'[\\/*?:"<>|]', "", name).strip()
+
+
+def get_existing_file_metadata_drive(service, folder_id, filename):
+    """Gets metadata of an existing file in Google Drive folder."""
+    if not folder_id or not filename:
+        return None
+    try:
+        escaped_name = filename.replace("'", "\\'")
+        query = f"name='{escaped_name}' and '{folder_id}' in parents"
+        response = (
+            service.files()
+            .list(q=query, fields="files(id, size, modifiedTime)")
+            .execute()
+        )
+        files = response.get("files", [])
+        if files:
+            file = files[0]  # Take the first if multiple
+            return {
+                "id": file.get("id"),
+                "size": int(file.get("size", 0)) if file.get("size") else 0,
+                "modified_time": file.get("modifiedTime"),
+            }
+    except HttpError as error:
+        print(f"Error fetching metadata for '{filename}': {error}")
+    return None
+
+
+def get_existing_file_metadata_local(folder_path, filename):
+    """Gets metadata of an existing file in local folder."""
+    if not folder_path or not filename:
+        return None
+    path = os.path.join(folder_path, filename)
+    if os.path.exists(path):
+        try:
+            return {
+                "size": os.path.getsize(path),
+                "modified_time": os.path.getmtime(path),
+            }
+        except OSError as error:
+            print(f"Error getting metadata for '{path}': {error}")
+    return None
+
+
+def has_file_changed(existing_metadata, canvas_size=None, canvas_updated_at=None):
+    """Checks if file has changed based on metadata."""
+    if not existing_metadata:
+        return True  # New file
+    if canvas_size is not None and existing_metadata["size"] != canvas_size:
+        return True
+    if canvas_updated_at and existing_metadata["modified_time"]:
+        # Compare timestamps, assuming canvas_updated_at is ISO format
+        from datetime import datetime
+
+        try:
+            canvas_time = datetime.fromisoformat(
+                canvas_updated_at.replace("Z", "+00:00")
+            )
+            existing_time = datetime.fromisoformat(
+                existing_metadata["modified_time"].replace("Z", "+00:00")
+            )
+            if canvas_time > existing_time:
+                return True
+        except ValueError:
+            pass  # If parsing fails, assume changed
+    return False
 
 
 def html_to_pdf_elements(html_content, base_styles):
@@ -117,6 +184,8 @@ def html_to_pdf_elements(html_content, base_styles):
         if element.name is None:  # Text node
             text = element.string
             if text and text.strip():
+                # Escape HTML entities to prevent parsing errors
+                text = html.escape(text, quote=False)
                 if current_style:
                     return f'<font name="{current_style.fontName}" size="{current_style.fontSize}">{text}</font>'
                 else:
@@ -420,7 +489,9 @@ def get_drive_service():
 
 def get_or_create_folder(service, folder_name, parent_id=None):
     """Finds a folder by name. If not found, creates it. Returns the folder ID."""
-    query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder'"
+    # Escape single quotes in folder_name for query
+    escaped_name = folder_name.replace("'", "\\'")
+    query = f"name='{escaped_name}' and mimeType='application/vnd.google-apps.folder'"
     query += f" and '{parent_id}' in parents" if parent_id else " and 'root' in parents"
     try:
         response = (
@@ -460,22 +531,29 @@ def get_existing_files_in_drive_folder(service, folder_id):
         return set()
 
 
-def upload_file_to_drive(service, local_path, drive_filename, folder_id):
-    """Uploads a single file to the specified Google Drive folder."""
+def upload_file_to_drive(
+    service, local_path, drive_filename, folder_id, existing_file_id=None
+):
+    """Uploads a single file to the specified Google Drive folder, or updates if existing_file_id provided."""
     if not os.path.exists(local_path):
         return False
     try:
-        print(f"Uploading '{drive_filename}' to Google Drive...")
-        file_metadata = {"name": drive_filename, "parents": [folder_id]}
-        # Specify mimetype for HTML files for better browser handling
-        mimetype = "text/html" if drive_filename.lower().endswith(".html") else None
-        media = MediaFileUpload(local_path, mimetype=mimetype)
-        service.files().create(
-            body=file_metadata, media_body=media, fields="id"
-        ).execute()
+        if existing_file_id:
+            print(f"Updating '{drive_filename}' in Google Drive...")
+            media = MediaFileUpload(local_path)
+            service.files().update(fileId=existing_file_id, media_body=media).execute()
+        else:
+            print(f"Uploading '{drive_filename}' to Google Drive...")
+            file_metadata = {"name": drive_filename, "parents": [folder_id]}
+            # Specify mimetype for HTML files for better browser handling
+            mimetype = "text/html" if drive_filename.lower().endswith(".html") else None
+            media = MediaFileUpload(local_path, mimetype=mimetype)
+            service.files().create(
+                body=file_metadata, media_body=media, fields="id"
+            ).execute()
         return True
     except HttpError as error:
-        print(f"An error occurred during file upload: {error}")
+        print(f"An error occurred during file upload/update: {error}")
         return False
 
 
@@ -575,6 +653,8 @@ def process_canvas_file(
     file_id = file_info.get("id")
     filename = file_info.get("display_name")
     file_download_url = file_info.get("url")
+    file_size = file_info.get("size")
+    file_updated_at = file_info.get("updated_at")
 
     if (
         not all([file_id, filename, file_download_url])
@@ -584,15 +664,33 @@ def process_canvas_file(
 
     processed_canvas_file_ids.add(file_id)
 
-    if filename in existing_files:
-        return 0
+    # Get existing file metadata
+    if storage_type == "google_drive":
+        existing_metadata = get_existing_file_metadata_drive(
+            drive_service, folder_path_or_id, filename
+        )
+    else:
+        existing_metadata = get_existing_file_metadata_local(
+            folder_path_or_id, filename
+        )
 
-    print(f"New file found: '{filename}'")
+    # Check if file has changed
+    if not has_file_changed(
+        existing_metadata, canvas_size=file_size, canvas_updated_at=file_updated_at
+    ):
+        return 0  # No change
+
+    print(f"{'Updating' if existing_metadata else 'New'} file found: '{filename}'")
     local_filepath = os.path.join(DOWNLOAD_DIR, filename)
     if download_canvas_file(file_download_url, local_filepath, canvas_headers):
+        existing_file_id = existing_metadata.get("id") if existing_metadata else None
         if storage_type == "google_drive":
             success = upload_file_to_drive(
-                drive_service, local_filepath, filename, folder_path_or_id
+                drive_service,
+                local_filepath,
+                filename,
+                folder_path_or_id,
+                existing_file_id,
             )
         else:  # local storage
             success = save_file_locally(local_filepath, filename, folder_path_or_id)
@@ -623,6 +721,7 @@ def process_canvas_assignment(
     due_at = assignment_info.get("due_at")
     points_possible = assignment_info.get("points_possible")
     rubric = assignment_info.get("rubric") or assignment_info.get("rubric_settings")
+    updated_at = assignment_info.get("updated_at")
 
     if not assignment_name:
         return 0
@@ -639,19 +738,27 @@ def process_canvas_assignment(
         )
         if not assignment_storage_path:
             return 0
-        existing_files = get_existing_files_in_drive_folder(
-            drive_service, assignment_storage_path
+        pdf_filename = f"{safe_assignment_name}.pdf"
+        existing_metadata = get_existing_file_metadata_drive(
+            drive_service, assignment_storage_path, pdf_filename
         )
     else:  # local storage
         assignment_storage_path = get_or_create_local_folder(
             assignments_root_path_or_id, assignment_folder_name
         )
-        existing_files = get_existing_files_in_local_folder(assignment_storage_path)
+        pdf_filename = f"{safe_assignment_name}.pdf"
+        existing_metadata = get_existing_file_metadata_local(
+            assignment_storage_path, pdf_filename
+        )
 
-    # Generate and save PDF version
-    pdf_filename = f"{safe_assignment_name}.pdf"
-    if pdf_filename not in existing_files:
-        print(f"New assignment found: '{assignment_name}'")
+    # Check if assignment has changed
+    if not has_file_changed(existing_metadata, canvas_updated_at=updated_at):
+        # Still need to process linked files, but skip PDF generation
+        pass
+    else:
+        print(
+            f"{'Updating' if existing_metadata else 'New'} assignment found: '{assignment_name}'"
+        )
         local_pdf_path = os.path.join(DOWNLOAD_DIR, pdf_filename)
         try:
             # Create PDF document
@@ -673,20 +780,23 @@ def process_canvas_assignment(
             content = []
 
             # Title
-            content.append(Paragraph(assignment_name, title_style))
+            escaped_assignment_name = html.escape(assignment_name, quote=False)
+            content.append(Paragraph(escaped_assignment_name, title_style))
             content.append(Spacer(1, 12))
 
             # Due date
             if due_at:
-                content.append(Paragraph(f"<b>Due:</b> {due_at}", normal_style))
+                escaped_due_at = html.escape(str(due_at), quote=False)
+                content.append(Paragraph(f"<b>Due:</b> {escaped_due_at}", normal_style))
             else:
                 content.append(Paragraph("<b>Due:</b> N/A", normal_style))
             content.append(Spacer(1, 6))
 
             # Points
             if points_possible:
+                escaped_points = html.escape(str(points_possible), quote=False)
                 content.append(
-                    Paragraph(f"<b>Points:</b> {points_possible}", normal_style)
+                    Paragraph(f"<b>Points:</b> {escaped_points}", normal_style)
                 )
             else:
                 content.append(Paragraph("<b>Points:</b> N/A", normal_style))
@@ -705,7 +815,10 @@ def process_canvas_assignment(
                             criterion_points = criterion.get("points", 0)
 
                             if criterion_desc:
-                                criterion_text = f"<b>{criterion_desc}</b> ({criterion_points} points)"
+                                escaped_criterion_desc = html.escape(
+                                    criterion_desc, quote=False
+                                )
+                                criterion_text = f"<b>{escaped_criterion_desc}</b> ({criterion_points} points)"
                                 content.append(Paragraph(criterion_text, normal_style))
 
                                 # Add criterion long description if available
@@ -714,12 +827,11 @@ def process_canvas_assignment(
                                     and criterion_long_desc.strip()
                                     and criterion_long_desc != criterion_desc
                                 ):
-                                    content.append(
-                                        Paragraph(
-                                            f"<i>{criterion_long_desc}</i>",
-                                            normal_style,
-                                        )
+                                    # Process HTML content properly
+                                    html_elements = html_to_pdf_elements(
+                                        f"<i>{criterion_long_desc}</i>", styles
                                     )
+                                    content.extend(html_elements)
                                     content.append(Spacer(1, 3))
                                 else:
                                     content.append(Spacer(1, 3))
@@ -739,7 +851,10 @@ def process_canvas_assignment(
                                         rating_points = rating.get("points", 0)
 
                                         if rating_desc:
-                                            rating_text = f"  • {rating_desc} ({rating_points} points)"
+                                            escaped_rating_desc = html.escape(
+                                                rating_desc, quote=False
+                                            )
+                                            rating_text = f"  • {escaped_rating_desc} ({rating_points} points)"
                                             content.append(
                                                 Paragraph(rating_text, normal_style)
                                             )
@@ -750,12 +865,12 @@ def process_canvas_assignment(
                                                 and rating_long_desc.strip()
                                                 and rating_long_desc != rating_desc
                                             ):
-                                                content.append(
-                                                    Paragraph(
-                                                        f"    <i>{rating_long_desc}</i>",
-                                                        normal_style,
-                                                    )
+                                                # Process HTML content properly
+                                                html_elements = html_to_pdf_elements(
+                                                    f"    <i>{rating_long_desc}</i>",
+                                                    styles,
                                                 )
+                                                content.extend(html_elements)
                                                 content.append(Spacer(1, 2))
 
                                             # Add small description if available and different
@@ -764,19 +879,21 @@ def process_canvas_assignment(
                                                 and rating_small_desc.strip()
                                                 and rating_small_desc != rating_desc
                                             ):
-                                                content.append(
-                                                    Paragraph(
-                                                        f"    <i>{rating_small_desc}</i>",
-                                                        normal_style,
-                                                    )
+                                                # Process HTML content properly
+                                                html_elements = html_to_pdf_elements(
+                                                    f"    <i>{rating_small_desc}</i>",
+                                                    styles,
                                                 )
+                                                content.extend(html_elements)
                                                 content.append(Spacer(1, 2))
                                 content.append(Spacer(1, 6))
                     content.append(Spacer(1, 12))
                 except Exception as e:
+                    escaped_error = html.escape(str(e), quote=False)
                     content.append(
                         Paragraph(
-                            f"<i>Error processing rubric: {str(e)}</i>", normal_style
+                            f"<i>Error processing rubric: {escaped_error}</i>",
+                            normal_style,
                         )
                     )
                     content.append(Spacer(1, 12))
@@ -794,12 +911,16 @@ def process_canvas_assignment(
             # Generate PDF
             doc.build(content)
 
+            existing_file_id = (
+                existing_metadata.get("id") if existing_metadata else None
+            )
             if storage_type == "google_drive":
                 success = upload_file_to_drive(
                     drive_service,
                     local_pdf_path,
                     pdf_filename,
                     assignment_storage_path,
+                    existing_file_id,
                 )
             else:
                 success = save_file_locally(
@@ -813,10 +934,21 @@ def process_canvas_assignment(
             if os.path.exists(local_pdf_path):
                 os.remove(local_pdf_path)
         except Exception as e:
-            print(f"Could not save assignment '{assignment_name}' as PDF: {e}")
+            escaped_error = html.escape(str(e), quote=False)
+            print(
+                f"Could not save assignment '{assignment_name}' as PDF: {escaped_error}"
+            )
             # Clean up temporary PDF file if it exists
             if os.path.exists(local_pdf_path):
                 os.remove(local_pdf_path)
+
+    # Get existing files for linked files processing
+    if storage_type == "google_drive":
+        existing_files = get_existing_files_in_drive_folder(
+            drive_service, assignment_storage_path
+        )
+    else:
+        existing_files = get_existing_files_in_local_folder(assignment_storage_path)
 
     # Scan the assignment description for linked files
     if description:
@@ -1049,13 +1181,31 @@ def main():
                             )
 
                         pdf_filename = f"{safe_page_title}.pdf"
+                        updated_at = page_data.get("updated_at")
 
-                        # Create the full HTML content for both HTML and PDF generation
-                        full_html = f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>{page_title}</title></head><body>{html_body}</body></html>'
+                        # Get existing PDF metadata
+                        if storage_type == "google_drive":
+                            existing_metadata = get_existing_file_metadata_drive(
+                                drive_service, page_storage_path, pdf_filename
+                            )
+                        else:
+                            existing_metadata = get_existing_file_metadata_local(
+                                page_storage_path, pdf_filename
+                            )
 
-                        # Generate and save PDF version of the page
-                        if pdf_filename not in page_existing_files:
-                            print(f"New page found: '{page_title}'")
+                        # Check if page has changed
+                        if not has_file_changed(
+                            existing_metadata, canvas_updated_at=updated_at
+                        ):
+                            # Skip PDF generation, but still process linked files
+                            pass
+                        else:
+                            # Create the full HTML content for both HTML and PDF generation
+                            full_html = f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>{page_title}</title></head><body>{html_body}</body></html>'
+
+                            print(
+                                f"{'Updating' if existing_metadata else 'New'} page found: '{page_title}'"
+                            )
                             local_pdf_path = os.path.join(DOWNLOAD_DIR, pdf_filename)
                             try:
                                 # Create PDF document
@@ -1073,7 +1223,10 @@ def main():
                                 story = []
 
                                 # Add title
-                                story.append(Paragraph(page_title, title_style))
+                                escaped_page_title = html.escape(
+                                    page_title, quote=False
+                                )
+                                story.append(Paragraph(escaped_page_title, title_style))
                                 story.append(Spacer(1, 12))
 
                                 # Add content with preserved formatting
@@ -1082,12 +1235,18 @@ def main():
 
                                 doc.build(story)
 
+                                existing_file_id = (
+                                    existing_metadata.get("id")
+                                    if existing_metadata
+                                    else None
+                                )
                                 if storage_type == "google_drive":
                                     success = upload_file_to_drive(
                                         drive_service,
                                         local_pdf_path,
                                         pdf_filename,
                                         page_storage_path,
+                                        existing_file_id,
                                     )
                                 else:
                                     success = save_file_locally(
@@ -1101,7 +1260,10 @@ def main():
                                 if os.path.exists(local_pdf_path):
                                     os.remove(local_pdf_path)
                             except Exception as e:
-                                print(f"Could not save page '{page_title}' as PDF: {e}")
+                                escaped_error = html.escape(str(e), quote=False)
+                                print(
+                                    f"Could not save page '{page_title}' as PDF: {escaped_error}"
+                                )
                                 # Clean up temporary PDF file if it exists
                                 if os.path.exists(local_pdf_path):
                                     os.remove(local_pdf_path)
@@ -1138,10 +1300,10 @@ def main():
 
         if new_items_synced == 0:
             print(
-                "All discoverable files, pages, and assignments for this course are already in sync."
+                "All discoverable files, pages, and assignments for this course are already up to date."
             )
         else:
-            print(f"Synced {new_items_synced} new item(s) for '{course_name}'.")
+            print(f"Synced/updated {new_items_synced} item(s) for '{course_name}'.")
 
     shutil.rmtree(DOWNLOAD_DIR)
     print("\n--- Sync Complete ---")
