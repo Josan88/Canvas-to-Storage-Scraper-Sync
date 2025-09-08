@@ -255,6 +255,9 @@ def html_to_pdf_elements(html_content, base_styles):
             for child in element.children:
                 content += process_element(child, current_style)
             if content.strip():
+                # Skip anchor links that cause PDF generation issues
+                if href.startswith("#"):
+                    return content
                 # Create a link style
                 link_style = ParagraphStyle(
                     "link",
@@ -932,7 +935,12 @@ def process_canvas_assignment(
                 new_items_count += 1
             # Clean up temporary PDF file
             if os.path.exists(local_pdf_path):
-                os.remove(local_pdf_path)
+                try:
+                    os.remove(local_pdf_path)
+                except OSError as e:
+                    print(
+                        f"Warning: Could not remove temporary file '{local_pdf_path}': {e}"
+                    )
         except Exception as e:
             escaped_error = html.escape(str(e), quote=False)
             print(
@@ -940,7 +948,12 @@ def process_canvas_assignment(
             )
             # Clean up temporary PDF file if it exists
             if os.path.exists(local_pdf_path):
-                os.remove(local_pdf_path)
+                try:
+                    os.remove(local_pdf_path)
+                except OSError as e:
+                    print(
+                        f"Warning: Could not remove temporary file '{local_pdf_path}': {e}"
+                    )
 
     # Get existing files for linked files processing
     if storage_type == "google_drive":
@@ -1258,7 +1271,12 @@ def main():
                                     new_items_synced += 1
                                 # Clean up temporary PDF file
                                 if os.path.exists(local_pdf_path):
-                                    os.remove(local_pdf_path)
+                                    try:
+                                        os.remove(local_pdf_path)
+                                    except OSError as e:
+                                        print(
+                                            f"Warning: Could not remove temporary file '{local_pdf_path}': {e}"
+                                        )
                             except Exception as e:
                                 escaped_error = html.escape(str(e), quote=False)
                                 print(
@@ -1266,7 +1284,12 @@ def main():
                                 )
                                 # Clean up temporary PDF file if it exists
                                 if os.path.exists(local_pdf_path):
-                                    os.remove(local_pdf_path)
+                                    try:
+                                        os.remove(local_pdf_path)
+                                    except OSError as e:
+                                        print(
+                                            f"Warning: Could not remove temporary file '{local_pdf_path}': {e}"
+                                        )
 
                         # Also scan the page for files
                         soup = BeautifulSoup(html_body, "html.parser")
