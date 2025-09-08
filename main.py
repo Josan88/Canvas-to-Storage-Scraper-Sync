@@ -5,6 +5,17 @@ import shutil
 import re
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    ListFlowable,
+    ListItem,
+)
+from reportlab.lib.units import inch
+from reportlab.lib.colors import blue
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -24,6 +35,240 @@ DOWNLOAD_DIR = "temp_canvas_downloads"
 def sanitize_filename(name):
     """Removes invalid characters from a string to make it a valid filename."""
     return re.sub(r'[\\/*?:"<>|]', "", name).strip()
+
+
+def html_to_pdf_elements(html_content, base_styles):
+    """Convert HTML content to ReportLab flowables with formatting preserved."""
+    if not html_content:
+        return []
+
+    soup = BeautifulSoup(html_content, "html.parser")
+    elements = []
+
+    # Define styles for different HTML elements
+    styles = {
+        "p": base_styles["Normal"],
+        "h1": ParagraphStyle(
+            "h1", parent=base_styles["Heading1"], fontSize=18, spaceAfter=20
+        ),
+        "h2": ParagraphStyle(
+            "h2", parent=base_styles["Heading2"], fontSize=16, spaceAfter=18
+        ),
+        "h3": ParagraphStyle(
+            "h3", parent=base_styles["Heading3"], fontSize=14, spaceAfter=16
+        ),
+        "h4": ParagraphStyle(
+            "h4", parent=base_styles["Heading4"], fontSize=12, spaceAfter=14
+        ),
+        "h5": ParagraphStyle(
+            "h5",
+            parent=base_styles["Normal"],
+            fontSize=11,
+            fontName="Helvetica-Bold",
+            spaceAfter=12,
+        ),
+        "h6": ParagraphStyle(
+            "h6",
+            parent=base_styles["Normal"],
+            fontSize=10,
+            fontName="Helvetica-Bold",
+            spaceAfter=10,
+        ),
+        "strong": ParagraphStyle(
+            "strong", parent=base_styles["Normal"], fontName="Helvetica-Bold"
+        ),
+        "b": ParagraphStyle(
+            "b", parent=base_styles["Normal"], fontName="Helvetica-Bold"
+        ),
+        "em": ParagraphStyle(
+            "em", parent=base_styles["Normal"], fontName="Helvetica-Oblique"
+        ),
+        "i": ParagraphStyle(
+            "i", parent=base_styles["Normal"], fontName="Helvetica-Oblique"
+        ),
+        "u": ParagraphStyle("u", parent=base_styles["Normal"], underline=True),
+        "blockquote": ParagraphStyle(
+            "blockquote", parent=base_styles["Normal"], leftIndent=20, rightIndent=20
+        ),
+        "code": ParagraphStyle(
+            "code",
+            parent=base_styles["Normal"],
+            fontName="Courier",
+            fontSize=9,
+            backColor="#f0f0f0",
+        ),
+        "pre": ParagraphStyle(
+            "pre",
+            parent=base_styles["Normal"],
+            fontName="Courier",
+            fontSize=9,
+            leftIndent=10,
+        ),
+        "li": ParagraphStyle(
+            "li", parent=base_styles["Normal"], leftIndent=15, bulletIndent=5
+        ),
+    }
+
+    def process_element(element, current_style=None):
+        """Recursively process HTML elements and convert to formatted text."""
+        if element is None:
+            return ""
+
+        if element.name is None:  # Text node
+            text = element.string
+            if text and text.strip():
+                if current_style:
+                    return f'<font name="{current_style.fontName}" size="{current_style.fontSize}">{text}</font>'
+                else:
+                    return text
+            return ""
+
+        # Handle different HTML elements
+        tag_name = element.name.lower()
+
+        if tag_name in ["p", "div"]:
+            content = ""
+            for child in element.children:
+                child_result = process_element(child, current_style)
+                if child_result is not None:
+                    content += child_result
+            if content.strip():
+                style = current_style or styles.get("p", base_styles["Normal"])
+                elements.append(Paragraph(content, style))
+                elements.append(Spacer(1, 6))
+            return ""
+
+        elif tag_name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
+            content = ""
+            for child in element.children:
+                child_result = process_element(
+                    child, styles.get(tag_name, base_styles["Normal"])
+                )
+                if child_result is not None:
+                    content += child_result
+            if content.strip():
+                elements.append(
+                    Paragraph(content, styles.get(tag_name, base_styles["Normal"]))
+                )
+                elements.append(Spacer(1, 12))
+            return ""
+
+        elif tag_name in ["strong", "b"]:
+            content = ""
+            for child in element.children:
+                content += process_element(
+                    child, styles.get("strong", base_styles["Normal"])
+                )
+            return content
+
+        elif tag_name in ["em", "i"]:
+            content = ""
+            for child in element.children:
+                content += process_element(
+                    child, styles.get("em", base_styles["Normal"])
+                )
+            return content
+
+        elif tag_name == "u":
+            content = ""
+            for child in element.children:
+                content += process_element(
+                    child, styles.get("u", base_styles["Normal"])
+                )
+            return content
+
+        elif tag_name == "br":
+            return "<br/>"
+
+        elif tag_name == "a":
+            href = element.get("href", "")
+            content = ""
+            for child in element.children:
+                content += process_element(child, current_style)
+            if content.strip():
+                # Create a link style
+                link_style = ParagraphStyle(
+                    "link",
+                    parent=current_style or base_styles["Normal"],
+                    textColor=blue,
+                    underline=True,
+                )
+                return f'<link href="{href}">{content}</link>'
+            return content
+
+        elif tag_name in ["ul", "ol"]:
+            list_items = []
+            for li in element.find_all("li", recursive=False):
+                li_content = ""
+                for child in li.children:
+                    child_result = process_element(
+                        child, styles.get("li", base_styles["Normal"])
+                    )
+                    if child_result is not None:
+                        li_content += child_result
+                if li_content.strip():
+                    list_items.append(
+                        Paragraph(li_content, styles.get("li", base_styles["Normal"]))
+                    )
+
+            if list_items:
+                if tag_name == "ul":
+                    elements.append(
+                        ListFlowable(list_items, bulletType="bullet", start="•")
+                    )
+                else:  # ol
+                    elements.append(ListFlowable(list_items, bulletType="1"))
+                elements.append(Spacer(1, 6))
+            return ""
+
+        elif tag_name == "li":
+            # This should be handled by ul/ol processing above
+            content = ""
+            for child in element.children:
+                content += process_element(child, current_style)
+            return content
+
+        elif tag_name == "blockquote":
+            content = ""
+            for child in element.children:
+                child_result = process_element(
+                    child, styles.get("blockquote", base_styles["Normal"])
+                )
+                if child_result is not None:
+                    content += child_result
+            if content.strip():
+                elements.append(
+                    Paragraph(content, styles.get("blockquote", base_styles["Normal"]))
+                )
+                elements.append(Spacer(1, 6))
+            return ""
+
+        elif tag_name in ["code", "pre"]:
+            content = element.get_text()
+            if content.strip():
+                elements.append(
+                    Paragraph(content, styles.get(tag_name, base_styles["Normal"]))
+                )
+                elements.append(Spacer(1, 6))
+            return ""
+
+        else:
+            # For unknown tags, process children
+            content = ""
+            for child in element.children:
+                child_result = process_element(child, current_style)
+                if child_result is not None:
+                    content += child_result
+            return content
+
+    # Process all top-level elements
+    for element in soup.children:
+        if element.name or (
+            hasattr(element, "string") and element.string and element.string.strip()
+        ):
+            process_element(element)
+
+    return elements
 
 
 def display_courses_and_get_selection(courses, last_course_ids=None):
@@ -377,13 +622,13 @@ def process_canvas_assignment(
     description = assignment_info.get("description")
     due_at = assignment_info.get("due_at")
     points_possible = assignment_info.get("points_possible")
+    rubric = assignment_info.get("rubric") or assignment_info.get("rubric_settings")
 
     if not assignment_name:
         return 0
 
     safe_assignment_name = sanitize_filename(assignment_name)
     assignment_folder_name = safe_assignment_name
-    html_filename = f"{safe_assignment_name}.html"
 
     # Create a dedicated subfolder for the assignment
     if storage_type == "google_drive":
@@ -403,47 +648,175 @@ def process_canvas_assignment(
         )
         existing_files = get_existing_files_in_local_folder(assignment_storage_path)
 
-    # Save the main assignment HTML file if it doesn't exist
-    if html_filename not in existing_files:
+    # Generate and save PDF version
+    pdf_filename = f"{safe_assignment_name}.pdf"
+    if pdf_filename not in existing_files:
         print(f"New assignment found: '{assignment_name}'")
-        html_content = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="utf-8">
-            <title>{assignment_name}</title>
-        </head>
-        <body>
-            <h1>{assignment_name}</h1>
-            <p><b>Due:</b> {due_at or 'N/A'}</p>
-            <p><b>Points:</b> {points_possible or 'N/A'}</p>
-            <hr>
-            {description or ''}
-        </body>
-        </html>
-        """
-        local_html_path = os.path.join(DOWNLOAD_DIR, html_filename)
+        local_pdf_path = os.path.join(DOWNLOAD_DIR, pdf_filename)
         try:
-            with open(local_html_path, "w", encoding="utf-8") as f:
-                f.write(html_content)
+            # Create PDF document
+            doc = SimpleDocTemplate(local_pdf_path, pagesize=letter)
+            styles = getSampleStyleSheet()
+
+            # Create custom styles
+            title_style = ParagraphStyle(
+                "CustomTitle",
+                parent=styles["Heading1"],
+                fontSize=16,
+                spaceAfter=30,
+            )
+            normal_style = styles["Normal"]
+            bold_style = styles["Normal"]
+            bold_style.fontName = "Helvetica-Bold"
+
+            # Build PDF content
+            content = []
+
+            # Title
+            content.append(Paragraph(assignment_name, title_style))
+            content.append(Spacer(1, 12))
+
+            # Due date
+            if due_at:
+                content.append(Paragraph(f"<b>Due:</b> {due_at}", normal_style))
+            else:
+                content.append(Paragraph("<b>Due:</b> N/A", normal_style))
+            content.append(Spacer(1, 6))
+
+            # Points
+            if points_possible:
+                content.append(
+                    Paragraph(f"<b>Points:</b> {points_possible}", normal_style)
+                )
+            else:
+                content.append(Paragraph("<b>Points:</b> N/A", normal_style))
+            content.append(Spacer(1, 12))
+
+            # Rubric
+            if rubric and len(rubric) > 0:
+                content.append(Paragraph("<b>Rubric:</b>", bold_style))
+                content.append(Spacer(1, 6))
+
+                try:
+                    for criterion in rubric:
+                        if isinstance(criterion, dict):
+                            criterion_desc = criterion.get("description", "")
+                            criterion_long_desc = criterion.get("long_description", "")
+                            criterion_points = criterion.get("points", 0)
+
+                            if criterion_desc:
+                                criterion_text = f"<b>{criterion_desc}</b> ({criterion_points} points)"
+                                content.append(Paragraph(criterion_text, normal_style))
+
+                                # Add criterion long description if available
+                                if (
+                                    criterion_long_desc
+                                    and criterion_long_desc.strip()
+                                    and criterion_long_desc != criterion_desc
+                                ):
+                                    content.append(
+                                        Paragraph(
+                                            f"<i>{criterion_long_desc}</i>",
+                                            normal_style,
+                                        )
+                                    )
+                                    content.append(Spacer(1, 3))
+                                else:
+                                    content.append(Spacer(1, 3))
+
+                            # Add ratings if available
+                            ratings = criterion.get("ratings", [])
+                            if ratings and isinstance(ratings, list):
+                                for rating in ratings:
+                                    if isinstance(rating, dict):
+                                        rating_desc = rating.get("description", "")
+                                        rating_long_desc = rating.get(
+                                            "long_description", ""
+                                        )
+                                        rating_small_desc = rating.get(
+                                            "small_description", ""
+                                        )
+                                        rating_points = rating.get("points", 0)
+
+                                        if rating_desc:
+                                            rating_text = f"  • {rating_desc} ({rating_points} points)"
+                                            content.append(
+                                                Paragraph(rating_text, normal_style)
+                                            )
+
+                                            # Add long description if available and different from main description
+                                            if (
+                                                rating_long_desc
+                                                and rating_long_desc.strip()
+                                                and rating_long_desc != rating_desc
+                                            ):
+                                                content.append(
+                                                    Paragraph(
+                                                        f"    <i>{rating_long_desc}</i>",
+                                                        normal_style,
+                                                    )
+                                                )
+                                                content.append(Spacer(1, 2))
+
+                                            # Add small description if available and different
+                                            elif (
+                                                rating_small_desc
+                                                and rating_small_desc.strip()
+                                                and rating_small_desc != rating_desc
+                                            ):
+                                                content.append(
+                                                    Paragraph(
+                                                        f"    <i>{rating_small_desc}</i>",
+                                                        normal_style,
+                                                    )
+                                                )
+                                                content.append(Spacer(1, 2))
+                                content.append(Spacer(1, 6))
+                    content.append(Spacer(1, 12))
+                except Exception as e:
+                    content.append(
+                        Paragraph(
+                            f"<i>Error processing rubric: {str(e)}</i>", normal_style
+                        )
+                    )
+                    content.append(Spacer(1, 12))
+
+            # Separator
+            content.append(Paragraph("<hr/>", normal_style))
+            content.append(Spacer(1, 12))
+
+            # Description
+            if description:
+                # Convert HTML to formatted PDF elements
+                html_elements = html_to_pdf_elements(description, styles)
+                content.extend(html_elements)
+
+            # Generate PDF
+            doc.build(content)
 
             if storage_type == "google_drive":
                 success = upload_file_to_drive(
                     drive_service,
-                    local_html_path,
-                    html_filename,
+                    local_pdf_path,
+                    pdf_filename,
                     assignment_storage_path,
                 )
             else:
                 success = save_file_locally(
-                    local_html_path,
-                    html_filename,
+                    local_pdf_path,
+                    pdf_filename,
                     assignment_storage_path,
                 )
             if success:
                 new_items_count += 1
+            # Clean up temporary PDF file
+            if os.path.exists(local_pdf_path):
+                os.remove(local_pdf_path)
         except Exception as e:
-            print(f"Could not save assignment '{assignment_name}' as HTML: {e}")
+            print(f"Could not save assignment '{assignment_name}' as PDF: {e}")
+            # Clean up temporary PDF file if it exists
+            if os.path.exists(local_pdf_path):
+                os.remove(local_pdf_path)
 
     # Scan the assignment description for linked files
     if description:
@@ -587,7 +960,9 @@ def main():
 
         # --- Process Assignments ---
         print("Searching for assignments...")
-        assignments_url = f"{canvas_api_url}/api/v1/courses/{course_id}/assignments"
+        assignments_url = (
+            f"{canvas_api_url}/api/v1/courses/{course_id}/assignments?include[]=rubric"
+        )
         assignments = get_paginated_canvas_items(assignments_url, canvas_headers)
         if assignments:
             if storage_type == "google_drive":
@@ -673,36 +1048,63 @@ def main():
                                 page_storage_path
                             )
 
-                        html_filename = f"{safe_page_title}.html"
+                        pdf_filename = f"{safe_page_title}.pdf"
 
-                        if html_filename not in page_existing_files:
+                        # Create the full HTML content for both HTML and PDF generation
+                        full_html = f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>{page_title}</title></head><body>{html_body}</body></html>'
+
+                        # Generate and save PDF version of the page
+                        if pdf_filename not in page_existing_files:
                             print(f"New page found: '{page_title}'")
-                            local_html_path = os.path.join(DOWNLOAD_DIR, html_filename)
-                            full_html = f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>{page_title}</title></head><body>{html_body}</body></html>'
-
+                            local_pdf_path = os.path.join(DOWNLOAD_DIR, pdf_filename)
                             try:
-                                with open(local_html_path, "w", encoding="utf-8") as f:
-                                    f.write(full_html)
+                                # Create PDF document
+                                doc = SimpleDocTemplate(local_pdf_path, pagesize=letter)
+                                styles = getSampleStyleSheet()
+
+                                # Create title style
+                                title_style = ParagraphStyle(
+                                    "CustomTitle",
+                                    parent=styles["Heading1"],
+                                    fontSize=16,
+                                    spaceAfter=30,
+                                )
+
+                                story = []
+
+                                # Add title
+                                story.append(Paragraph(page_title, title_style))
+                                story.append(Spacer(1, 12))
+
+                                # Add content with preserved formatting
+                                html_elements = html_to_pdf_elements(full_html, styles)
+                                story.extend(html_elements)
+
+                                doc.build(story)
 
                                 if storage_type == "google_drive":
                                     success = upload_file_to_drive(
                                         drive_service,
-                                        local_html_path,
-                                        html_filename,
+                                        local_pdf_path,
+                                        pdf_filename,
                                         page_storage_path,
                                     )
                                 else:
                                     success = save_file_locally(
-                                        local_html_path,
-                                        html_filename,
+                                        local_pdf_path,
+                                        pdf_filename,
                                         page_storage_path,
                                     )
                                 if success:
                                     new_items_synced += 1
+                                # Clean up temporary PDF file
+                                if os.path.exists(local_pdf_path):
+                                    os.remove(local_pdf_path)
                             except Exception as e:
-                                print(
-                                    f"Could not save page '{page_title}' as HTML: {e}"
-                                )
+                                print(f"Could not save page '{page_title}' as PDF: {e}")
+                                # Clean up temporary PDF file if it exists
+                                if os.path.exists(local_pdf_path):
+                                    os.remove(local_pdf_path)
 
                         # Also scan the page for files
                         soup = BeautifulSoup(html_body, "html.parser")
