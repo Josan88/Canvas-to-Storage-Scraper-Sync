@@ -31,3 +31,7 @@ temp_canvas_downloads/
 
 # Logs
 *.log
+
+build/
+dist/
+*.spec
