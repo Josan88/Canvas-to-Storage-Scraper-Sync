@@ -111,6 +111,7 @@ def html_to_pdf_elements(html_content, base_styles):
 
     soup = BeautifulSoup(html_content, "html.parser")
     elements = []
+    inline_buffer = ""  # Accumulates inline-only content to wrap into a paragraph
 
     # Define styles for different HTML elements
     styles = {
@@ -334,11 +335,48 @@ def html_to_pdf_elements(html_content, base_styles):
             return content
 
     # Process all top-level elements
+    def is_block_tag(name: str) -> bool:
+        if not name:
+            return False
+        name = name.lower()
+        return name in {
+            "p",
+            "div",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "ul",
+            "ol",
+            "li",
+            "blockquote",
+            "pre",
+            "code",
+        }
+
     for element in soup.children:
+        # If we encounter a block-level element, flush any accumulated inline content first
+        if getattr(element, "name", None) and is_block_tag(element.name):
+            if inline_buffer.strip():
+                elements.append(Paragraph(inline_buffer, base_styles["Normal"]))
+                elements.append(Spacer(1, 6))
+                inline_buffer = ""
+            process_element(element)
+            continue
+
+        # Otherwise, collect inline content and wrap later as a paragraph
         if element.name or (
             hasattr(element, "string") and element.string and element.string.strip()
         ):
-            process_element(element)
+            returned_text = process_element(element)
+            if isinstance(returned_text, str) and returned_text.strip():
+                inline_buffer += returned_text
+
+    # Flush any remaining inline content as a final paragraph
+    if inline_buffer.strip():
+        elements.append(Paragraph(inline_buffer, base_styles["Normal"]))
 
     return elements
 
@@ -716,6 +754,7 @@ def process_canvas_assignment(
     storage_type,
     drive_service=None,
     local_root_dir=None,
+    force_regen_assignments=False,
 ):
     """Saves an assignment's details and linked files."""
     new_items_count = 0
@@ -754,8 +793,10 @@ def process_canvas_assignment(
             assignment_storage_path, pdf_filename
         )
 
-    # Check if assignment has changed
-    if not has_file_changed(existing_metadata, canvas_updated_at=updated_at):
+    # Check if assignment has changed (or force regeneration via config)
+    if not force_regen_assignments and not has_file_changed(
+        existing_metadata, canvas_updated_at=updated_at
+    ):
         # Still need to process linked files, but skip PDF generation
         pass
     else:
@@ -830,11 +871,29 @@ def process_canvas_assignment(
                                     and criterion_long_desc.strip()
                                     and criterion_long_desc != criterion_desc
                                 ):
-                                    # Process HTML content properly
+                                    # Process HTML content properly with safe fallback
                                     html_elements = html_to_pdf_elements(
                                         f"<i>{criterion_long_desc}</i>", styles
                                     )
-                                    content.extend(html_elements)
+                                    if html_elements:
+                                        content.extend(html_elements)
+                                    else:
+                                        # Fallback to plain text if inline-only content produced nothing
+                                        try:
+                                            from bs4 import BeautifulSoup as _BS
+
+                                            plain = _BS(
+                                                criterion_long_desc, "html.parser"
+                                            ).get_text(" ", strip=True)
+                                        except Exception:
+                                            plain = criterion_long_desc
+                                        if plain and plain.strip():
+                                            content.append(
+                                                Paragraph(
+                                                    f"<i>{html.escape(plain, quote=False)}</i>",
+                                                    normal_style,
+                                                )
+                                            )
                                     content.append(Spacer(1, 3))
                                 else:
                                     content.append(Spacer(1, 3))
@@ -868,12 +927,32 @@ def process_canvas_assignment(
                                                 and rating_long_desc.strip()
                                                 and rating_long_desc != rating_desc
                                             ):
-                                                # Process HTML content properly
+                                                # Process HTML content properly with safe fallback
                                                 html_elements = html_to_pdf_elements(
                                                     f"    <i>{rating_long_desc}</i>",
                                                     styles,
                                                 )
-                                                content.extend(html_elements)
+                                                if html_elements:
+                                                    content.extend(html_elements)
+                                                else:
+                                                    try:
+                                                        from bs4 import (
+                                                            BeautifulSoup as _BS,
+                                                        )
+
+                                                        plain = _BS(
+                                                            rating_long_desc,
+                                                            "html.parser",
+                                                        ).get_text(" ", strip=True)
+                                                    except Exception:
+                                                        plain = rating_long_desc
+                                                    if plain and plain.strip():
+                                                        content.append(
+                                                            Paragraph(
+                                                                f"<i>{html.escape(plain, quote=False)}</i>",
+                                                                normal_style,
+                                                            )
+                                                        )
                                                 content.append(Spacer(1, 2))
 
                                             # Add small description if available and different
@@ -882,12 +961,32 @@ def process_canvas_assignment(
                                                 and rating_small_desc.strip()
                                                 and rating_small_desc != rating_desc
                                             ):
-                                                # Process HTML content properly
+                                                # Process HTML content properly with safe fallback
                                                 html_elements = html_to_pdf_elements(
                                                     f"    <i>{rating_small_desc}</i>",
                                                     styles,
                                                 )
-                                                content.extend(html_elements)
+                                                if html_elements:
+                                                    content.extend(html_elements)
+                                                else:
+                                                    try:
+                                                        from bs4 import (
+                                                            BeautifulSoup as _BS,
+                                                        )
+
+                                                        plain = _BS(
+                                                            rating_small_desc,
+                                                            "html.parser",
+                                                        ).get_text(" ", strip=True)
+                                                    except Exception:
+                                                        plain = rating_small_desc
+                                                    if plain and plain.strip():
+                                                        content.append(
+                                                            Paragraph(
+                                                                f"<i>{html.escape(plain, quote=False)}</i>",
+                                                                normal_style,
+                                                            )
+                                                        )
                                                 content.append(Spacer(1, 2))
                                 content.append(Spacer(1, 6))
                     content.append(Spacer(1, 12))
@@ -1006,6 +1105,10 @@ def main():
         canvas_api_url = config["CANVAS"]["API_URL"]
         canvas_api_key = config["CANVAS"]["API_KEY"]
         storage_type = config["STORAGE"]["STORAGE_TYPE"].lower()
+        # Optional: force regenerate assignment PDFs regardless of Canvas updated_at
+        force_regen_assignments = config["STORAGE"].get(
+            "FORCE_REGENERATE_ASSIGNMENTS", "false"
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
 
         local_root_dir = None
         if storage_type == "google_drive":
@@ -1130,6 +1233,7 @@ def main():
                         storage_type,
                         drive_service,
                         local_root_dir,
+                        force_regen_assignments=force_regen_assignments,
                     )
 
         # --- Process Modules (Files and Pages) ---

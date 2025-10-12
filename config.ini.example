@@ -9,6 +9,10 @@ API_KEY = your_canvas_api_key_here
 STORAGE_TYPE = local
 # For local storage: the root directory where files will be stored
 LOCAL_ROOT_DIR = ./canvas_sync
+
+# Optional: force regenerate assignment PDFs regardless of Canvas updated_at timestamp
+# Use true/false, yes/no, 1/0 (case-insensitive). Default is false.
+FORCE_REGENERATE_ASSIGNMENTS=false
 # For Google Drive storage: the name of the main folder in Google Drive
 ROOT_FOLDER_NAME = Canvas Sync
 
