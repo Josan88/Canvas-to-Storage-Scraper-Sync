@@ -19,3 +19,18 @@ ROOT_FOLDER_NAME = Canvas Sync
 [LAST_SELECTION]
 # Last selected course IDs (comma-separated)
 COURSE_IDS = 
+
+[PERFORMANCE]
+# Optional performance tuning (safe defaults are used if omitted)
+# HTTP request timeout in seconds
+REQUEST_TIMEOUT = 20
+# Max retries for transient HTTP errors (429/5xx)
+MAX_RETRIES = 3
+# Exponential backoff factor between retries
+BACKOFF_FACTOR = 0.5
+# Canvas API page size to reduce pagination roundtrips (Canvas typically allows up to 100)
+CANVAS_PER_PAGE = 100
+# HTTP connection pool size for Canvas requests
+HTTP_POOL_MAXSIZE = 20
+# Google Drive upload chunk size in MB (resumable upload)
+DRIVE_CHUNK_SIZE_MB = 8

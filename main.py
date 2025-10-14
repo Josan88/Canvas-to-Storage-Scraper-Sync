@@ -24,6 +24,8 @@ from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 from datetime import datetime
 import html
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 
 # --- Configuration ---
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -31,6 +33,14 @@ CONFIG_FILE = "config.ini"
 GOOGLE_CREDS_FILE = "credentials.json"
 GOOGLE_TOKEN_FILE = "token.json"
 DOWNLOAD_DIR = "temp_canvas_downloads"
+
+# Performance tuning defaults (overridable via config.ini [PERFORMANCE])
+DEFAULT_REQUEST_TIMEOUT = 20  # seconds
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_BACKOFF_FACTOR = 0.5
+DEFAULT_CANVAS_PER_PAGE = 100
+DEFAULT_HTTP_POOL_MAXSIZE = 20
+DEFAULT_DRIVE_CHUNK_SIZE_MB = 8
 
 
 # --- Helper Functions ---
@@ -45,7 +55,7 @@ def get_existing_file_metadata_drive(service, folder_id, filename):
         return None
     try:
         escaped_name = filename.replace("'", "\\'")
-        query = f"name='{escaped_name}' and '{folder_id}' in parents"
+        query = f"name='{escaped_name}' and '{folder_id}' in parents and trashed=false"
         response = (
             service.files()
             .list(q=query, fields="files(id, size, modifiedTime)")
@@ -573,22 +583,30 @@ def get_existing_files_in_drive_folder(service, folder_id):
 
 
 def upload_file_to_drive(
-    service, local_path, drive_filename, folder_id, existing_file_id=None
+    service,
+    local_path,
+    drive_filename,
+    folder_id,
+    existing_file_id=None,
+    drive_chunk_size_mb: int = DEFAULT_DRIVE_CHUNK_SIZE_MB,
 ):
     """Uploads a single file to the specified Google Drive folder, or updates if existing_file_id provided."""
     if not os.path.exists(local_path):
         return False
     try:
+        chunk_bytes = max(256 * 1024, drive_chunk_size_mb * 1024 * 1024)
         if existing_file_id:
             print(f"Updating '{drive_filename}' in Google Drive...")
-            media = MediaFileUpload(local_path)
+            media = MediaFileUpload(local_path, chunksize=chunk_bytes, resumable=True)
             service.files().update(fileId=existing_file_id, media_body=media).execute()
         else:
             print(f"Uploading '{drive_filename}' to Google Drive...")
             file_metadata = {"name": drive_filename, "parents": [folder_id]}
             # Specify mimetype for HTML files for better browser handling
             mimetype = "text/html" if drive_filename.lower().endswith(".html") else None
-            media = MediaFileUpload(local_path, mimetype=mimetype)
+            media = MediaFileUpload(
+                local_path, mimetype=mimetype, chunksize=chunk_bytes, resumable=True
+            )
             service.files().create(
                 body=file_metadata, media_body=media, fields="id"
             ).execute()
@@ -643,12 +661,17 @@ def save_file_locally(local_path, filename, folder_path):
         return False
 
 
-def get_paginated_canvas_items(url, headers):
-    """Handles Canvas API pagination to retrieve all items from an endpoint."""
+def get_paginated_canvas_items(
+    url, headers, session: requests.Session, timeout: int, per_page: int
+):
+    """Handles Canvas API pagination to retrieve all items from an endpoint using a shared session, with per_page sizing."""
+    # Append per_page if not already present
+    if "per_page=" not in url:
+        url += ("&" if "?" in url else "?") + f"per_page={per_page}"
     items, next_url = [], url
     while next_url:
         try:
-            response = requests.get(next_url, headers=headers)
+            response = session.get(next_url, headers=headers, timeout=timeout)
             response.raise_for_status()
             items.extend(response.json())
             next_url = None
@@ -663,10 +686,12 @@ def get_paginated_canvas_items(url, headers):
     return items
 
 
-def download_canvas_file(file_url, local_path, headers):
+def download_canvas_file(
+    file_url, local_path, headers, session: requests.Session, timeout: int
+):
     """Downloads a file from a Canvas URL to a local path."""
     try:
-        with requests.get(file_url, headers=headers, stream=True) as r:
+        with session.get(file_url, headers=headers, stream=True, timeout=timeout) as r:
             r.raise_for_status()
             with open(local_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
@@ -683,12 +708,14 @@ def download_canvas_file(file_url, local_path, headers):
 def process_canvas_file(
     file_info,
     folder_path_or_id,
-    existing_files,
     processed_canvas_file_ids,
     canvas_headers,
     storage_type,
     drive_service=None,
     local_root_dir=None,
+    session: requests.Session = None,
+    timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    drive_chunk_size_mb: int = DEFAULT_DRIVE_CHUNK_SIZE_MB,
 ):
     """Helper function to check, download, and save/upload a single Canvas file."""
     file_id = file_info.get("id")
@@ -723,7 +750,9 @@ def process_canvas_file(
 
     print(f"{'Updating' if existing_metadata else 'New'} file found: '{filename}'")
     local_filepath = os.path.join(DOWNLOAD_DIR, filename)
-    if download_canvas_file(file_download_url, local_filepath, canvas_headers):
+    if download_canvas_file(
+        file_download_url, local_filepath, canvas_headers, session, timeout
+    ):
         existing_file_id = existing_metadata.get("id") if existing_metadata else None
         if storage_type == "google_drive":
             success = upload_file_to_drive(
@@ -732,6 +761,7 @@ def process_canvas_file(
                 filename,
                 folder_path_or_id,
                 existing_file_id,
+                drive_chunk_size_mb=drive_chunk_size_mb,
             )
         else:  # local storage
             success = save_file_locally(local_filepath, filename, folder_path_or_id)
@@ -755,6 +785,9 @@ def process_canvas_assignment(
     drive_service=None,
     local_root_dir=None,
     force_regen_assignments=False,
+    session: requests.Session = None,
+    timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    drive_chunk_size_mb: int = DEFAULT_DRIVE_CHUNK_SIZE_MB,
 ):
     """Saves an assignment's details and linked files."""
     new_items_count = 0
@@ -1054,13 +1087,7 @@ def process_canvas_assignment(
                         f"Warning: Could not remove temporary file '{local_pdf_path}': {e}"
                     )
 
-    # Get existing files for linked files processing
-    if storage_type == "google_drive":
-        existing_files = get_existing_files_in_drive_folder(
-            drive_service, assignment_storage_path
-        )
-    else:
-        existing_files = get_existing_files_in_local_folder(assignment_storage_path)
+    # Avoid listing entire folder contents to reduce API calls; rely on per-file metadata checks.
 
     # Scan the assignment description for linked files
     if description:
@@ -1072,18 +1099,22 @@ def process_canvas_assignment(
                 file_id = match.group(1)
                 file_api_url = f"{canvas_api_url}/api/v1/files/{file_id}"
                 try:
-                    file_info_resp = requests.get(file_api_url, headers=canvas_headers)
+                    file_info_resp = session.get(
+                        file_api_url, headers=canvas_headers, timeout=timeout
+                    )
                     file_info_resp.raise_for_status()
                     if file_info_resp.ok:
                         new_items_count += process_canvas_file(
                             file_info_resp.json(),
                             assignment_storage_path,
-                            existing_files,
                             processed_canvas_file_ids,
                             canvas_headers,
                             storage_type,
                             drive_service,
                             local_root_dir,
+                            session=session,
+                            timeout=timeout,
+                            drive_chunk_size_mb=drive_chunk_size_mb,
                         )
                 except requests.RequestException as e:
                     print(f"Could not fetch file link from assignment: {e}")
@@ -1146,9 +1177,49 @@ def main():
         shutil.rmtree(DOWNLOAD_DIR)
     os.makedirs(DOWNLOAD_DIR)
 
+    # Performance tuning from config (optional)
+    try:
+        perf_cfg = config["PERFORMANCE"] if config.has_section("PERFORMANCE") else {}
+        request_timeout = int(perf_cfg.get("REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT))
+        max_retries = int(perf_cfg.get("MAX_RETRIES", DEFAULT_MAX_RETRIES))
+        backoff_factor = float(perf_cfg.get("BACKOFF_FACTOR", DEFAULT_BACKOFF_FACTOR))
+        canvas_per_page = int(perf_cfg.get("CANVAS_PER_PAGE", DEFAULT_CANVAS_PER_PAGE))
+        http_pool_maxsize = int(
+            perf_cfg.get("HTTP_POOL_MAXSIZE", DEFAULT_HTTP_POOL_MAXSIZE)
+        )
+        drive_chunk_size_mb = int(
+            perf_cfg.get("DRIVE_CHUNK_SIZE_MB", DEFAULT_DRIVE_CHUNK_SIZE_MB)
+        )
+    except Exception:
+        request_timeout = DEFAULT_REQUEST_TIMEOUT
+        max_retries = DEFAULT_MAX_RETRIES
+        backoff_factor = DEFAULT_BACKOFF_FACTOR
+        canvas_per_page = DEFAULT_CANVAS_PER_PAGE
+        http_pool_maxsize = DEFAULT_HTTP_POOL_MAXSIZE
+        drive_chunk_size_mb = DEFAULT_DRIVE_CHUNK_SIZE_MB
+
+    # Shared HTTP session with retries and connection pooling
+    session = requests.Session()
+    retries = Retry(
+        total=max_retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "POST", "PUT", "PATCH"),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(
+        max_retries=retries,
+        pool_connections=http_pool_maxsize,
+        pool_maxsize=http_pool_maxsize,
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+
     print("\nFetching courses from Canvas...")
     courses_url = f"{canvas_api_url}/api/v1/courses"
-    courses = get_paginated_canvas_items(courses_url, canvas_headers)
+    courses = get_paginated_canvas_items(
+        courses_url, canvas_headers, session, request_timeout, canvas_per_page
+    )
     if not courses:
         print("No courses found.")
         return
@@ -1192,15 +1263,9 @@ def main():
             )
             if not course_storage_path:
                 continue
-            existing_files_in_course_folder = get_existing_files_in_drive_folder(
-                drive_service, course_storage_path
-            )
         else:  # local storage
             course_storage_path = get_or_create_local_folder(
                 local_root_dir, course_name
-            )
-            existing_files_in_course_folder = get_existing_files_in_local_folder(
-                course_storage_path
             )
 
         processed_canvas_file_ids = set()
@@ -1211,7 +1276,9 @@ def main():
         assignments_url = (
             f"{canvas_api_url}/api/v1/courses/{course_id}/assignments?include[]=rubric"
         )
-        assignments = get_paginated_canvas_items(assignments_url, canvas_headers)
+        assignments = get_paginated_canvas_items(
+            assignments_url, canvas_headers, session, request_timeout, canvas_per_page
+        )
         if assignments:
             if storage_type == "google_drive":
                 assignments_folder_path = get_or_create_folder(
@@ -1234,39 +1301,50 @@ def main():
                         drive_service,
                         local_root_dir,
                         force_regen_assignments=force_regen_assignments,
+                        session=session,
+                        timeout=request_timeout,
+                        drive_chunk_size_mb=drive_chunk_size_mb,
                     )
 
         # --- Process Modules (Files and Pages) ---
         print("Searching for files and pages in modules...")
         modules_url = f"{canvas_api_url}/api/v1/courses/{course_id}/modules"
-        modules = get_paginated_canvas_items(modules_url, canvas_headers)
+        modules = get_paginated_canvas_items(
+            modules_url, canvas_headers, session, request_timeout, canvas_per_page
+        )
 
         for module in modules:
             items_url = f"{canvas_api_url}/api/v1/courses/{course_id}/modules/{module['id']}/items"
-            module_items = get_paginated_canvas_items(items_url, canvas_headers)
+            module_items = get_paginated_canvas_items(
+                items_url, canvas_headers, session, request_timeout, canvas_per_page
+            )
 
             for item in module_items:
                 try:
                     # Case 1: Item is a direct file link
                     if item.get("type") == "File":
-                        file_details_resp = requests.get(
-                            item["url"], headers=canvas_headers
+                        file_details_resp = session.get(
+                            item["url"], headers=canvas_headers, timeout=request_timeout
                         )
                         file_details_resp.raise_for_status()
                         new_items_synced += process_canvas_file(
                             file_details_resp.json(),
                             course_storage_path,
-                            existing_files_in_course_folder,
                             processed_canvas_file_ids,
                             canvas_headers,
                             storage_type,
                             drive_service,
                             local_root_dir,
+                            session=session,
+                            timeout=request_timeout,
+                            drive_chunk_size_mb=drive_chunk_size_mb,
                         )
 
                     # Case 2: Item is a Page, which we save as an HTML file
                     elif item.get("type") == "Page":
-                        page_resp = requests.get(item["url"], headers=canvas_headers)
+                        page_resp = session.get(
+                            item["url"], headers=canvas_headers, timeout=request_timeout
+                        )
                         page_resp.raise_for_status()
                         page_data = page_resp.json()
                         page_title = page_data.get("title")
@@ -1286,15 +1364,10 @@ def main():
                             )
                             if not page_storage_path:
                                 continue
-                            page_existing_files = get_existing_files_in_drive_folder(
-                                drive_service, page_storage_path
-                            )
+                            # Avoid full folder listing for performance
                         else:  # local storage
                             page_storage_path = get_or_create_local_folder(
                                 course_storage_path, page_folder_name
-                            )
-                            page_existing_files = get_existing_files_in_local_folder(
-                                page_storage_path
                             )
 
                         pdf_filename = f"{safe_page_title}.pdf"
@@ -1405,19 +1478,23 @@ def main():
                                 file_api_url = (
                                     f"{canvas_api_url}/api/v1/files/{file_id_from_page}"
                                 )
-                                file_info_resp = requests.get(
-                                    file_api_url, headers=canvas_headers
+                                file_info_resp = session.get(
+                                    file_api_url,
+                                    headers=canvas_headers,
+                                    timeout=request_timeout,
                                 )
                                 if file_info_resp.ok:
                                     new_items_synced += process_canvas_file(
                                         file_info_resp.json(),
                                         page_storage_path,
-                                        page_existing_files,
                                         processed_canvas_file_ids,
                                         canvas_headers,
                                         storage_type,
                                         drive_service,
                                         local_root_dir,
+                                        session=session,
+                                        timeout=request_timeout,
+                                        drive_chunk_size_mb=drive_chunk_size_mb,
                                     )
 
                 except requests.exceptions.RequestException as e:

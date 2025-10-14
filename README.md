@@ -144,3 +144,16 @@ The script remembers your last course selection and offers it as an option for f
 - If your last selected courses are no longer available, you'll be prompted to select manually.
 
 This feature makes it convenient to sync the same set of courses repeatedly without re-selecting them each time.
+
+## Performance tuning
+
+For large courses, you can speed up syncs by tweaking the optional [PERFORMANCE] section in `config.ini`:
+
+- REQUEST_TIMEOUT: HTTP timeout in seconds (default 20)
+- MAX_RETRIES: Retries on transient errors (429/5xx) with exponential backoff (default 3)
+- BACKOFF_FACTOR: Backoff multiplier between retries (default 0.5)
+- CANVAS_PER_PAGE: Canvas API page size to cut down pagination (default 100)
+- HTTP_POOL_MAXSIZE: HTTP connection pool size for Canvas requests (default 20)
+- DRIVE_CHUNK_SIZE_MB: Google Drive resumable upload chunk size in MB (default 8)
+
+The script also reuses a single connection-pooled HTTP session and only regenerates PDFs or re-downloads files when Canvas reports a newer update time or file size change. This avoids unnecessary work on repeated runs.
