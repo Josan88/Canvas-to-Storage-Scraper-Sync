@@ -21,7 +21,6 @@ ENV/
 Thumbs.db
 
 # Credentials and config
-config.ini
 credentials.json
 token.json
 
