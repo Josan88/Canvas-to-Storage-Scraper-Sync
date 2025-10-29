@@ -18,6 +18,7 @@ from reportlab.platypus import (
     ListItem,
     PageBreak,
 )
+from reportlab.platypus.tableofcontents import TableOfContents
 from reportlab.lib.units import inch
 from reportlab.lib.colors import blue, HexColor
 from google.auth.transport.requests import Request
@@ -695,7 +696,12 @@ def save_file_locally(local_path, filename, folder_path):
 
 
 def get_paginated_canvas_items(
-    url, headers, session: Optional[requests.Session], timeout: int, per_page: int
+    url,
+    headers,
+    session: Optional[requests.Session],
+    timeout: int,
+    per_page: int,
+    suppress_errors: bool = False,
 ):
     """Handles Canvas API pagination to retrieve all items from an endpoint using a shared session, with per_page sizing."""
     if session is None:
@@ -716,7 +722,8 @@ def get_paginated_canvas_items(
                     (link["url"] for link in links if link.get("rel") == "next"), None
                 )
         except requests.exceptions.RequestException as e:
-            print(f"Error fetching data from Canvas: {e}")
+            if not suppress_errors:
+                print(f"Error fetching data from Canvas: {e}")
             break
     return items
 
@@ -1190,6 +1197,340 @@ def process_canvas_assignment(
     return new_items_count
 
 
+def _parse_iso_utc(dt_str: str):
+    """Parse an ISO 8601 string (potentially with trailing 'Z') into a timezone-aware datetime in UTC.
+
+    Returns None if parsing fails or input is falsy.
+    """
+    if not dt_str or not isinstance(dt_str, str):
+        return None
+    try:
+        from datetime import datetime, timezone
+
+        ds = dt_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(ds)
+        # Ensure tz-aware and in UTC
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _to_utc_datetime(value):
+    """Best-effort conversion of various timestamp representations to UTC datetime.
+
+    Supports:
+    - ISO 8601 strings (with or without 'Z')
+    - POSIX timestamps (float/int seconds since epoch)
+    Returns None if conversion fails.
+    """
+    from datetime import datetime, timezone
+
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except Exception:
+            return None
+    if isinstance(value, str):
+        return _parse_iso_utc(value)
+    return None
+
+
+def process_course_pages(
+    course_id: int,
+    course_name: str,
+    course_storage_path_or_id,
+    canvas_api_url: str,
+    canvas_headers: dict,
+    storage_type: str,
+    drive_service=None,
+    session: Optional[requests.Session] = None,
+    timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    per_page: int = DEFAULT_CANVAS_PER_PAGE,
+    summary: Optional[SummaryCollector] = None,
+):
+    """Fetch all course pages, merge them into a single PDF, and upload/save if changed.
+
+    - Creates/uses a "Pages" folder under the course directory.
+    - Output filename: "All Pages.pdf".
+    - Change detection: compares max(page.updated_at) vs existing PDF modified time.
+    """
+    if session is None:
+        session = requests.Session()
+
+    # Build/get destination folder
+    pages_folder_label = f"{course_name}/Pages"
+    output_filename = "All Pages.pdf"
+
+    if storage_type == "google_drive":
+        pages_folder_path_or_id = get_or_create_folder(
+            drive_service, "Pages", parent_id=course_storage_path_or_id
+        )
+    else:
+        pages_folder_path_or_id = get_or_create_local_folder(
+            course_storage_path_or_id, "Pages"
+        )
+
+    if not pages_folder_path_or_id:
+        return 0
+
+    # Fetch pages with body included (normalize base URL to avoid double slashes)
+    base_url = (canvas_api_url or "").rstrip("/")
+    pages_url = f"{base_url}/api/v1/courses/{course_id}/pages?include[]=body"
+    pages = get_paginated_canvas_items(
+        pages_url, canvas_headers, session, timeout, per_page, suppress_errors=True
+    )
+
+    # Fallback: if pages endpoint not available (404 or disabled), try discovering pages via modules
+    if not pages:
+        try:
+            modules_url = f"{base_url}/api/v1/courses/{course_id}/modules"
+            modules = get_paginated_canvas_items(
+                modules_url,
+                canvas_headers,
+                session,
+                timeout,
+                per_page,
+                suppress_errors=True,
+            )
+            pages_map = {}
+            for module in modules or []:
+                items_url = f"{base_url}/api/v1/courses/{course_id}/modules/{module.get('id')}/items"
+                module_items = get_paginated_canvas_items(
+                    items_url,
+                    canvas_headers,
+                    session,
+                    timeout,
+                    per_page,
+                    suppress_errors=True,
+                )
+                for item in module_items or []:
+                    if item.get("type") == "Page" and item.get("url"):
+                        # Fetch page details to get body and timestamps
+                        try:
+                            resp = session.get(
+                                item["url"], headers=canvas_headers, timeout=timeout
+                            )
+                            resp.raise_for_status()
+                            pd = resp.json()
+                            slug = (
+                                pd.get("url") or item.get("page_url") or pd.get("title")
+                            )
+                            if slug and slug not in pages_map:
+                                pages_map[slug] = {
+                                    "title": pd.get("title"),
+                                    "body": pd.get("body"),
+                                    "updated_at": pd.get("updated_at"),
+                                    "html_url": pd.get("html_url"),
+                                    "url": pd.get("url"),
+                                }
+                        except requests.RequestException:
+                            continue
+            pages = list(pages_map.values())
+        except Exception:
+            pages = []
+
+    if not pages:
+        return 0
+
+    # Sort pages for a stable order (by title)
+    try:
+        pages.sort(key=lambda p: (p.get("title") or "").lower())
+    except Exception:
+        pass
+
+    # Determine if anything changed by checking the newest updated_at across pages
+    max_updated_at_iso = None
+    try:
+        page_times = [p.get("updated_at") for p in pages if p.get("updated_at")]
+        if page_times:
+            # Convert to datetime then back to ISO for consistent compare usage
+            from datetime import timezone
+
+            dts = [_parse_iso_utc(t) for t in page_times]
+            dts = [dt for dt in dts if dt is not None]
+            if dts:
+                max_dt = max(dts)
+                max_updated_at_iso = max_dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        # If we can't compute max time, fallback to regenerating (safer)
+        max_updated_at_iso = None
+
+    # Existing metadata lookup
+    if storage_type == "google_drive":
+        existing_metadata = get_existing_file_metadata_drive(
+            drive_service, pages_folder_path_or_id, output_filename
+        )
+    else:
+        existing_metadata = get_existing_file_metadata_local(
+            pages_folder_path_or_id, output_filename
+        )
+
+    # Decide whether to rebuild
+    should_rebuild = True
+    if existing_metadata and max_updated_at_iso:
+        # Compare existing modified time (could be iso string for Drive or epoch for local)
+        existing_mod = existing_metadata.get("modified_time")
+        existing_dt = _to_utc_datetime(existing_mod)
+        newest_page_dt = _parse_iso_utc(max_updated_at_iso)
+        if existing_dt and newest_page_dt and newest_page_dt <= existing_dt:
+            should_rebuild = False
+
+    if not should_rebuild:
+        return 0
+
+    print(
+        f"{'Updating' if existing_metadata else 'New'} course pages bundle for '{course_name}'"
+    )
+
+    # Create PDF
+    local_pdf_path = os.path.join(DOWNLOAD_DIR, output_filename)
+    try:
+        # Custom DocTemplate to capture headings for TOC and create bookmarks
+        class TOCDocTemplate(SimpleDocTemplate):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._h_seq = 0
+
+            def afterFlowable(self, flowable):
+                # Capture PageTitle paragraphs as TOC entries and bookmarks
+                try:
+                    if (
+                        isinstance(flowable, Paragraph)
+                        and getattr(flowable.style, "name", "") == "PageTitle"
+                    ):
+                        text = flowable.getPlainText()
+                        self._h_seq += 1
+                        key = f"h{self._h_seq}"
+                        # Bookmark destination on current page
+                        self.canv.bookmarkPage(key)
+                        # Notify TOC with clickable destination key
+                        self.notify("TOCEntry", (0, text, self.page, key))
+                except Exception:
+                    # Don't block PDF build if TOC capture fails
+                    pass
+
+        doc = TOCDocTemplate(local_pdf_path, pagesize=letter)
+        styles = getSampleStyleSheet()
+
+        title_style = ParagraphStyle(
+            "CoursePagesTitle", parent=styles["Heading1"], fontSize=18, spaceAfter=24
+        )
+        page_title_style = ParagraphStyle(
+            "PageTitle", parent=styles["Heading2"], fontSize=14, spaceAfter=12
+        )
+        toc_title_style = ParagraphStyle(
+            "TOCTitle", parent=styles["Heading2"], fontSize=14, spaceAfter=6
+        )
+        link_style = ParagraphStyle(
+            "PageLink",
+            parent=styles["Normal"],
+            textColor=blue,
+            underline=True,
+            spaceAfter=6,
+        )
+
+        content = []
+        # Top title
+        content.append(Paragraph(html.escape(f"{course_name} — Pages"), title_style))
+        content.append(Spacer(1, 12))
+
+        # Table of Contents section (simple internal links, no page numbers)
+        content.append(Paragraph("Table of Contents", toc_title_style))
+        content.append(Spacer(1, 4))
+        for i, p in enumerate(pages, start=1):
+            t = html.escape(p.get("title") or "Untitled Page", quote=False)
+            content.append(Paragraph(f'<link href="#h{i}">{t}</link>', link_style))
+        content.append(PageBreak())
+
+        # Add each page
+        for idx, page in enumerate(pages):
+            title = page.get("title") or "Untitled Page"
+            body = page.get("body") or ""
+            page_url = page.get("html_url")
+            if not page_url:
+                # Fallback to construct from slug if available
+                slug = page.get("url")
+                try:
+                    parsed = urlparse(canvas_api_url)
+                    if parsed.scheme and parsed.netloc and slug:
+                        page_url = f"{parsed.scheme}://{parsed.netloc}/courses/{course_id}/pages/{slug}"
+                except Exception:
+                    page_url = None
+
+            safe_title = html.escape(title, quote=False)
+            content.append(Paragraph(safe_title, page_title_style))
+            content.append(Spacer(1, 6))
+
+            # External link back to Canvas page (if resolvable)
+            if page_url:
+                safe_url = html.escape(page_url, quote=True)
+                content.append(
+                    Paragraph(
+                        f'<link href="{safe_url}">View on Canvas</link>', link_style
+                    )
+                )
+
+            if body:
+                html_elements = html_to_pdf_elements(body, styles)
+                if html_elements:
+                    content.extend(html_elements)
+            # Add a page break between pages, except after the last one
+            if idx < len(pages) - 1:
+                content.append(PageBreak())
+
+        # Build PDF (single pass; internal links don't need page numbers)
+        doc.build(content)
+
+        # Upload/Save
+        if storage_type == "google_drive":
+            existing_file_id = (
+                existing_metadata.get("id") if existing_metadata else None
+            )
+            success = upload_file_to_drive(
+                drive_service,
+                local_pdf_path,
+                output_filename,
+                pages_folder_path_or_id,
+                existing_file_id,
+            )
+        else:
+            success = save_file_locally(
+                local_pdf_path, output_filename, pages_folder_path_or_id
+            )
+
+        # Cleanup temp
+        if os.path.exists(local_pdf_path):
+            try:
+                os.remove(local_pdf_path)
+            except OSError:
+                pass
+
+        if success:
+            # Record summary
+            if summary is not None:
+                summary.add_file(
+                    course_name,
+                    pages_folder_label,
+                    output_filename,
+                    "updated" if existing_metadata else "created",
+                )
+            return 1
+    except Exception as e:
+        print(f"Failed to build/upload merged pages PDF for '{course_name}': {e}")
+        # Cleanup temp if present
+        if os.path.exists(local_pdf_path):
+            try:
+                os.remove(local_pdf_path)
+            except OSError:
+                pass
+
+    return 0
+
+
 def main():
     """Main function to run the sync process."""
     print("--- Starting Canvas to Storage Sync ---")
@@ -1594,6 +1935,24 @@ def main():
                     print(f"Could not retrieve details for a module item: {e}")
                 except Exception as e:
                     print(f"An unexpected error occurred processing module item: {e}")
+
+        # Merge all course pages into a single PDF
+        try:
+            new_items_synced += process_course_pages(
+                course_id=course_id,
+                course_name=course_name,
+                course_storage_path_or_id=course_storage_path,
+                canvas_api_url=canvas_api_url,
+                canvas_headers=canvas_headers,
+                storage_type=storage_type,
+                drive_service=drive_service,
+                session=session,
+                timeout=request_timeout,
+                per_page=canvas_per_page,
+                summary=summary,
+            )
+        except Exception as e:
+            print(f"Error merging course pages for '{course_name}': {e}")
 
         if new_items_synced == 0:
             print(
