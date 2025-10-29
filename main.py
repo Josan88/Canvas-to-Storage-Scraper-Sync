@@ -3,8 +3,11 @@ import requests
 import configparser
 import shutil
 import re
+from typing import Optional, Dict, List, DefaultDict
+from collections import defaultdict
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
+from bs4.element import Tag, NavigableString
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import (
@@ -13,9 +16,10 @@ from reportlab.platypus import (
     Spacer,
     ListFlowable,
     ListItem,
+    PageBreak,
 )
 from reportlab.lib.units import inch
-from reportlab.lib.colors import blue
+from reportlab.lib.colors import blue, HexColor
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -44,6 +48,37 @@ DEFAULT_DRIVE_CHUNK_SIZE_MB = 8
 
 
 # --- Helper Functions ---
+class SummaryCollector:
+    """Collects a per-course summary of updated/created files grouped by destination folder label."""
+
+    def __init__(self):
+        # Structure: { course_name: { dest_label: [ (filename, action) ] } }
+        self.per_course: Dict[str, DefaultDict[str, List[tuple]]] = {}
+
+    def add_file(self, course_name: str, dest_label: str, filename: str, action: str):
+        if not course_name or not dest_label or not filename:
+            return
+        if course_name not in self.per_course:
+            self.per_course[course_name] = defaultdict(list)
+        self.per_course[course_name][dest_label].append((filename, action))
+
+    def has_changes(self) -> bool:
+        return any(self.per_course.get(c) for c in self.per_course)
+
+    def print_summary(self):
+        print("\n=== Summary of Updates ===")
+        if not self.has_changes():
+            print("No files or folders were updated across the selected courses.")
+            return
+        for course_name, folders in self.per_course.items():
+            print(f"\nCourse: {course_name}")
+            for dest_label, items in folders.items():
+                print(f"  Folder: {dest_label}")
+                for filename, action in items:
+                    print(f"    - {filename}  [{action}]")
+        print("\n==========================")
+
+
 def sanitize_filename(name):
     """Removes invalid characters from a string to make it a valid filename."""
     return re.sub(r'[\\/*?:"<>|]', "", name).strip()
@@ -173,7 +208,7 @@ def html_to_pdf_elements(html_content, base_styles):
             parent=base_styles["Normal"],
             fontName="Courier",
             fontSize=9,
-            backColor="#f0f0f0",
+            backColor=HexColor("#f0f0f0"),
         ),
         "pre": ParagraphStyle(
             "pre",
@@ -368,7 +403,7 @@ def html_to_pdf_elements(html_content, base_styles):
 
     for element in soup.children:
         # If we encounter a block-level element, flush any accumulated inline content first
-        if getattr(element, "name", None) and is_block_tag(element.name):
+        if isinstance(element, Tag) and is_block_tag(element.name):
             if inline_buffer.strip():
                 elements.append(Paragraph(inline_buffer, base_styles["Normal"]))
                 elements.append(Spacer(1, 6))
@@ -377,9 +412,7 @@ def html_to_pdf_elements(html_content, base_styles):
             continue
 
         # Otherwise, collect inline content and wrap later as a paragraph
-        if element.name or (
-            hasattr(element, "string") and element.string and element.string.strip()
-        ):
+        if isinstance(element, (Tag, NavigableString)):
             returned_text = process_element(element)
             if isinstance(returned_text, str) and returned_text.strip():
                 inline_buffer += returned_text
@@ -662,9 +695,11 @@ def save_file_locally(local_path, filename, folder_path):
 
 
 def get_paginated_canvas_items(
-    url, headers, session: requests.Session, timeout: int, per_page: int
+    url, headers, session: Optional[requests.Session], timeout: int, per_page: int
 ):
     """Handles Canvas API pagination to retrieve all items from an endpoint using a shared session, with per_page sizing."""
+    if session is None:
+        session = requests.Session()
     # Append per_page if not already present
     if "per_page=" not in url:
         url += ("&" if "?" in url else "?") + f"per_page={per_page}"
@@ -687,9 +722,11 @@ def get_paginated_canvas_items(
 
 
 def download_canvas_file(
-    file_url, local_path, headers, session: requests.Session, timeout: int
+    file_url, local_path, headers, session: Optional[requests.Session], timeout: int
 ):
     """Downloads a file from a Canvas URL to a local path."""
+    if session is None:
+        session = requests.Session()
     try:
         with session.get(file_url, headers=headers, stream=True, timeout=timeout) as r:
             r.raise_for_status()
@@ -713,9 +750,12 @@ def process_canvas_file(
     storage_type,
     drive_service=None,
     local_root_dir=None,
-    session: requests.Session = None,
+    session: Optional[requests.Session] = None,
     timeout: int = DEFAULT_REQUEST_TIMEOUT,
     drive_chunk_size_mb: int = DEFAULT_DRIVE_CHUNK_SIZE_MB,
+    summary: Optional[SummaryCollector] = None,
+    course_name: Optional[str] = None,
+    dest_label: Optional[str] = None,
 ):
     """Helper function to check, download, and save/upload a single Canvas file."""
     file_id = file_info.get("id")
@@ -767,6 +807,14 @@ def process_canvas_file(
             success = save_file_locally(local_filepath, filename, folder_path_or_id)
 
         if success:
+            # Record in summary
+            if summary and course_name and dest_label:
+                summary.add_file(
+                    course_name,
+                    dest_label,
+                    filename,
+                    "updated" if existing_metadata else "created",
+                )
             return 1
         else:
             # If save/upload failed, remove the downloaded file
@@ -785,11 +833,15 @@ def process_canvas_assignment(
     drive_service=None,
     local_root_dir=None,
     force_regen_assignments=False,
-    session: requests.Session = None,
+    session: Optional[requests.Session] = None,
     timeout: int = DEFAULT_REQUEST_TIMEOUT,
     drive_chunk_size_mb: int = DEFAULT_DRIVE_CHUNK_SIZE_MB,
+    summary: Optional[SummaryCollector] = None,
+    course_name: Optional[str] = None,
 ):
     """Saves an assignment's details and linked files."""
+    if session is None:
+        session = requests.Session()
     new_items_count = 0
     assignment_name = assignment_info.get("name")
     description = assignment_info.get("description")
@@ -1065,6 +1117,15 @@ def process_canvas_assignment(
                 )
             if success:
                 new_items_count += 1
+                # Record in summary
+                if summary and course_name:
+                    dest_label = f"{course_name}/Assignments/{assignment_folder_name}"
+                    summary.add_file(
+                        course_name,
+                        dest_label,
+                        pdf_filename,
+                        "updated" if existing_metadata else "created",
+                    )
             # Clean up temporary PDF file
             if os.path.exists(local_pdf_path):
                 try:
@@ -1093,7 +1154,11 @@ def process_canvas_assignment(
     if description:
         soup = BeautifulSoup(description, "html.parser")
         for link in soup.find_all("a", href=True):
-            href = link["href"]
+            if not isinstance(link, Tag):
+                continue
+            href = link.get("href", "")
+            if not isinstance(href, str):
+                continue
             match = re.search(r"/files/(\d+)", href)
             if match:
                 file_id = match.group(1)
@@ -1115,6 +1180,9 @@ def process_canvas_assignment(
                             session=session,
                             timeout=timeout,
                             drive_chunk_size_mb=drive_chunk_size_mb,
+                            summary=summary,
+                            course_name=course_name,
+                            dest_label=f"{course_name}/Assignments/{assignment_folder_name}",
                         )
                 except requests.RequestException as e:
                     print(f"Could not fetch file link from assignment: {e}")
@@ -1125,6 +1193,7 @@ def process_canvas_assignment(
 def main():
     """Main function to run the sync process."""
     print("--- Starting Canvas to Storage Sync ---")
+    summary = SummaryCollector()
 
     config = configparser.ConfigParser()
     if not os.path.exists(CONFIG_FILE):
@@ -1141,7 +1210,8 @@ def main():
             "FORCE_REGENERATE_ASSIGNMENTS", "false"
         ).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-        local_root_dir = None
+        local_root_dir: Optional[str] = None
+        drive_root_folder_name: Optional[str] = None
         if storage_type == "google_drive":
             drive_root_folder_name = config["STORAGE"]["ROOT_FOLDER_NAME"]
         elif storage_type == "local":
@@ -1168,6 +1238,9 @@ def main():
             return
         print(f"Syncing to Google Drive folder: '{drive_root_folder_name}'")
     else:  # local storage
+        if local_root_dir is None:
+            print("ERROR: LOCAL_ROOT_DIR not configured.")
+            return
         root_storage_path = os.path.abspath(local_root_dir)
         if not os.path.exists(root_storage_path):
             os.makedirs(root_storage_path)
@@ -1304,6 +1377,8 @@ def main():
                         session=session,
                         timeout=request_timeout,
                         drive_chunk_size_mb=drive_chunk_size_mb,
+                        summary=summary,
+                        course_name=course_name,
                     )
 
         # --- Process Modules (Files and Pages) ---
@@ -1338,6 +1413,9 @@ def main():
                             session=session,
                             timeout=request_timeout,
                             drive_chunk_size_mb=drive_chunk_size_mb,
+                            summary=summary,
+                            course_name=course_name,
+                            dest_label=f"{course_name}",
                         )
 
                     # Case 2: Item is a Page, which we save as an HTML file
@@ -1446,6 +1524,14 @@ def main():
                                     )
                                 if success:
                                     new_items_synced += 1
+                                    # Record in summary
+                                    dest_label = f"{course_name}/{page_folder_name}"
+                                    summary.add_file(
+                                        course_name,
+                                        dest_label,
+                                        pdf_filename,
+                                        "updated" if existing_metadata else "created",
+                                    )
                                 # Clean up temporary PDF file
                                 if os.path.exists(local_pdf_path):
                                     try:
@@ -1471,7 +1557,11 @@ def main():
                         # Also scan the page for files
                         soup = BeautifulSoup(html_body, "html.parser")
                         for link in soup.find_all("a", href=True):
-                            href = link["href"]
+                            if not isinstance(link, Tag):
+                                continue
+                            href = link.get("href", "")
+                            if not isinstance(href, str):
+                                continue
                             match = re.search(r"/files/(\d+)", href)
                             if match:
                                 file_id_from_page = match.group(1)
@@ -1495,6 +1585,9 @@ def main():
                                         session=session,
                                         timeout=request_timeout,
                                         drive_chunk_size_mb=drive_chunk_size_mb,
+                                        summary=summary,
+                                        course_name=course_name,
+                                        dest_label=f"{course_name}/{page_folder_name}",
                                     )
 
                 except requests.exceptions.RequestException as e:
@@ -1509,8 +1602,18 @@ def main():
         else:
             print(f"Synced/updated {new_items_synced} item(s) for '{course_name}'.")
 
+    # Print summary before cleanup
+    summary.print_summary()
+
     shutil.rmtree(DOWNLOAD_DIR)
     print("\n--- Sync Complete ---")
+
+    # Prevent automatic exit so users can read the summary, especially when double-clicking an exe
+    try:
+        input("\nPress Enter to exit...")
+    except EOFError:
+        # Non-interactive environment; just return
+        pass
 
 
 if __name__ == "__main__":
