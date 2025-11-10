@@ -1280,58 +1280,68 @@ def process_course_pages(
     # Fetch pages with body included (normalize base URL to avoid double slashes)
     base_url = (canvas_api_url or "").rstrip("/")
     pages_url = f"{base_url}/api/v1/courses/{course_id}/pages?include[]=body"
-    pages = get_paginated_canvas_items(
+    pages_from_api = get_paginated_canvas_items(
         pages_url, canvas_headers, session, timeout, per_page, suppress_errors=True
     )
 
-    # Fallback: if pages endpoint not available (404 or disabled), try discovering pages via modules
-    if not pages:
-        try:
-            modules_url = f"{base_url}/api/v1/courses/{course_id}/modules"
-            modules = get_paginated_canvas_items(
-                modules_url,
+    # Always also discover pages via modules to catch pages that may not appear in the main pages list
+    # (e.g., pages only in modules, unpublished pages, or due to permissions)
+    pages_map = {}
+
+    # Add pages from the direct API endpoint first
+    for page in pages_from_api or []:
+        slug = page.get("url") or page.get("page_url") or page.get("title")
+        if slug:
+            pages_map[slug] = page
+
+    # Then discover and add pages from modules (won't overwrite existing ones)
+    try:
+        modules_url = f"{base_url}/api/v1/courses/{course_id}/modules"
+        modules = get_paginated_canvas_items(
+            modules_url,
+            canvas_headers,
+            session,
+            timeout,
+            per_page,
+            suppress_errors=True,
+        )
+        for module in modules or []:
+            items_url = f"{base_url}/api/v1/courses/{course_id}/modules/{module.get('id')}/items"
+            module_items = get_paginated_canvas_items(
+                items_url,
                 canvas_headers,
                 session,
                 timeout,
                 per_page,
                 suppress_errors=True,
             )
-            pages_map = {}
-            for module in modules or []:
-                items_url = f"{base_url}/api/v1/courses/{course_id}/modules/{module.get('id')}/items"
-                module_items = get_paginated_canvas_items(
-                    items_url,
-                    canvas_headers,
-                    session,
-                    timeout,
-                    per_page,
-                    suppress_errors=True,
-                )
-                for item in module_items or []:
-                    if item.get("type") == "Page" and item.get("url"):
-                        # Fetch page details to get body and timestamps
-                        try:
-                            resp = session.get(
-                                item["url"], headers=canvas_headers, timeout=timeout
-                            )
-                            resp.raise_for_status()
-                            pd = resp.json()
-                            slug = (
-                                pd.get("url") or item.get("page_url") or pd.get("title")
-                            )
-                            if slug and slug not in pages_map:
-                                pages_map[slug] = {
-                                    "title": pd.get("title"),
-                                    "body": pd.get("body"),
-                                    "updated_at": pd.get("updated_at"),
-                                    "html_url": pd.get("html_url"),
-                                    "url": pd.get("url"),
-                                }
-                        except requests.RequestException:
-                            continue
-            pages = list(pages_map.values())
-        except Exception:
-            pages = []
+            for item in module_items or []:
+                if item.get("type") == "Page" and item.get("url"):
+                    # Fetch page details to get body and timestamps
+                    try:
+                        resp = session.get(
+                            item["url"], headers=canvas_headers, timeout=timeout
+                        )
+                        resp.raise_for_status()
+                        pd = resp.json()
+                        slug = pd.get("url") or item.get("page_url") or pd.get("title")
+                        # Only add if not already present from pages API
+                        if slug and slug not in pages_map:
+                            pages_map[slug] = {
+                                "title": pd.get("title"),
+                                "body": pd.get("body"),
+                                "updated_at": pd.get("updated_at"),
+                                "html_url": pd.get("html_url"),
+                                "url": pd.get("url"),
+                            }
+                    except requests.RequestException:
+                        continue
+    except Exception:
+        # If module discovery fails, continue with just the pages from API
+        pass
+
+    # Convert map to list
+    pages = list(pages_map.values())
 
     if not pages:
         return 0

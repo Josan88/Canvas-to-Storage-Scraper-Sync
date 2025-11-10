@@ -34,4 +34,3 @@ temp_canvas_downloads/
 
 build/
 dist/
-*.spec
