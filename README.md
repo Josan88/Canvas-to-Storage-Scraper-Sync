@@ -2,9 +2,10 @@
 
 This script automates the process of downloading all files from your Canvas LMS courses and saving them either to a local directory on your computer or uploading them to a specified folder in your Google Drive, maintaining the course structure. It's designed to be run periodically to keep your storage in sync with Canvas.
 
+
 ## Features
 
-- Connects to the Canvas LMS API to fetch your courses and files.
+- Connects to the Canvas LMS API to fetch your courses, files, and quizzes.
 - **Choice of storage**: Save files locally or upload to Google Drive.
 - **Remembers last selection**: Automatically saves your course selection and offers to reuse it next time.
 - Creates a root folder/directory for organization.
@@ -12,10 +13,13 @@ This script automates the process of downloading all files from your Canvas LMS 
 - **Comprehensive page discovery**: Finds pages from both the Canvas Pages API and pages within modules.
 - **Consolidated page bundle**: Generates a single "All Pages.pdf" containing all course pages with table of contents.
 - **Assignment PDFs**: Converts assignments to PDF format with descriptions and details.
+- **Quiz export and summary**: Discovers quizzes for each course and exports a summary to the console. Quizzes are also saved in `quizzes.json` in the course Reports folder.
+- **Course reports (JSON)**: Exports announcements, discussions, quizzes, enrollments, calendar events, groups, analytics activity, gradebook history, and (optional) submissions summary into a course `Reports` folder.
 - For each Page in a course, creates a dedicated subfolder named after the Page.
 - Saves/uploads the Page's content and any files linked from that Page into the Page's subfolder.
 - **Smart change detection**: Only syncs when content has been updated or new content is added.
 - Cleans up temporary local files after processing.
+
 
 ## Folder Structure
 
@@ -30,6 +34,31 @@ Canvas Sync (Root Folder/Directory)
 │   ├── Pages
 │   │   └── All Pages.pdf
 │   ├── Direct Module Files...
+│   ├── Reports
+
+│   │   ├── announcements.json
+│   │   ├── discussion_topics.json
+│   │   ├── quizzes.json
+│   │   ├── enrollments.json
+│   │   ├── calendar_events.json
+│   │   ├── groups.json
+│   │   ├── analytics_activity.json
+│   │   ├── gradebook_history.json
+│   │   └── submissions_summary.json (optional)
+## Quizzes Export and Summary
+
+The script now discovers quizzes for each course using the Canvas Quizzes API. For every course processed, it prints a summary of quizzes found (title, due date, points possible) to the console. All quizzes are also exported to `quizzes.json` in the course's Reports folder for further analysis or archiving.
+
+**Example quiz summary output:**
+
+```
+Found 3 quizzes in 'Course Name':
+   - Quiz 1 | Due: 2025-12-01T23:59:00Z | Points: 100
+   - Quiz 2 | Due: N/A | Points: 50
+   - Final Exam | Due: 2025-12-15T12:00:00Z | Points: 200
+```
+
+This feature helps you keep track of all quizzes in your Canvas courses and ensures they are included in your course archive.
 │   ├── Page Title 1
 │   │   ├── Page Title 1.pdf
 │   │   └── Linked Files from Page...
@@ -38,13 +67,18 @@ Canvas Sync (Root Folder/Directory)
 │       └── Linked Files from Page...
 └── Course Name 2
     └── ...
+Conversations (root-level, optional)
+└── conversations.json
 ```
 
 - **Course Folders**: One folder per Canvas course.
 - **Assignments Folder**: Contains PDF versions of all course assignments.
 - **Pages Folder**: Contains "All Pages.pdf" - a consolidated bundle of all course pages with a table of contents.
+- **Reports Folder**: JSON exports for announcements, discussions, quizzes, enrollments, calendar events, groups, analytics activity, gradebook history, and optional submissions summary.
 - **Direct Module Files**: Files directly attached to course modules are saved here.
 - **Page Subfolders**: Each course page also gets its own subfolder containing the page's PDF and any linked files.
+- **Conversations folder**: Optional root-level archive of inbox conversations when enabled.
+
 
 ## Note on How Files Are Found
 
@@ -177,6 +211,15 @@ For large courses, you can speed up syncs by tweaking the optional [PERFORMANCE]
 - DRIVE_CHUNK_SIZE_MB: Google Drive resumable upload chunk size in MB (default 8)
 
 The script also reuses a single connection-pooled HTTP session and only regenerates PDFs or re-downloads files when Canvas reports a newer update time or file size change. This avoids unnecessary work on repeated runs.
+
+## Export toggles
+
+Use the optional [EXPORTS] section in `config.ini` to control heavy exports:
+
+- Most reports (announcements, discussions, quizzes, enrollments, calendar events, groups, analytics activity, gradebook history) default to `true`.
+- Heavier exports default to `false`: `EXPORT_SUBMISSIONS_SUMMARY`, `EXPORT_INBOX_CONVERSATIONS`.
+- Set any toggle to `true`/`false` (or yes/no, 1/0) to enable/disable.
+
 
 ## Sync Behavior and Change Detection
 

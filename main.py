@@ -29,8 +29,10 @@ from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 from datetime import datetime
 import html
+import json
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
+
 
 # --- Configuration ---
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -537,6 +539,43 @@ def load_last_selection():
             return set(course_ids_str.split(","))
 
     return None
+
+
+def get_canvas_quizzes(
+    course_id: int,
+    session: requests.Session,
+    api_url: str,
+    api_key: str,
+    timeout: int = 30,
+    per_page: int = 100,
+) -> list:
+    """
+    Fetch quizzes for a given Canvas course using the Quizzes API.
+    Returns a list of quiz dicts, or empty list on error.
+    """
+    url = f"{api_url}/api/v1/courses/{course_id}/quizzes"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    quizzes = []
+    params = {"per_page": per_page}
+    try:
+        while url:
+            response = session.get(url, headers=headers, params=params, timeout=timeout)
+            response.raise_for_status()
+            data = response.json()
+            quizzes.extend(data)
+            # Handle pagination
+            link = response.headers.get("Link", "")
+            next_url = None
+            for part in link.split(","):
+                if 'rel="next"' in part:
+                    next_url = part[part.find("<") + 1 : part.find(">")]
+                    break
+            url = next_url
+            params = {}  # Only use params on first request
+    except requests.RequestException as e:
+        print(f"Error fetching quizzes for course {course_id}: {e}")
+        return []
+    return quizzes
 
 
 # --- Google Drive Service Functions ---
@@ -1239,6 +1278,107 @@ def _to_utc_datetime(value):
     return None
 
 
+def _max_iso_datetime(values: List[str]):
+    """Return the max ISO timestamp (UTC) from a list of timestamp strings."""
+    try:
+        from datetime import timezone
+
+        timestamps = [_parse_iso_utc(v) for v in values if v]
+        timestamps = [t for t in timestamps if t]
+        if not timestamps:
+            return None
+        return max(timestamps).astimezone(timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def _max_timestamp_from_items(items: List[Dict], keys: List[str]):
+    """Best-effort extraction of the newest timestamp from a list of dict items."""
+    if not items:
+        return None
+    collected = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for key in keys:
+            value = item.get(key)
+            if value:
+                collected.append(value)
+    return _max_iso_datetime(collected)
+
+
+def _should_regenerate_resource(existing_metadata, newest_iso: Optional[str]):
+    """Decide whether to regenerate a derived resource based on newest item timestamp."""
+    if not existing_metadata:
+        return True
+    if newest_iso:
+        existing_dt = _to_utc_datetime(existing_metadata.get("modified_time"))
+        newest_dt = _parse_iso_utc(newest_iso)
+        if existing_dt and newest_dt and newest_dt <= existing_dt:
+            return False
+    return True
+
+
+def _export_json_resource(
+    data,
+    filename: str,
+    folder_path_or_id,
+    storage_type: str,
+    drive_service=None,
+    existing_metadata=None,
+    summary: Optional[SummaryCollector] = None,
+    course_name: Optional[str] = None,
+    dest_label: Optional[str] = None,
+):
+    """Serialize data to JSON, upload/save, record summary, and cleanup temp file."""
+    local_json_path = os.path.join(DOWNLOAD_DIR, filename)
+    try:
+        with open(local_json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        existing_file_id = existing_metadata.get("id") if existing_metadata else None
+        if storage_type == "google_drive":
+            success = upload_file_to_drive(
+                drive_service,
+                local_json_path,
+                filename,
+                folder_path_or_id,
+                existing_file_id,
+            )
+        else:
+            success = save_file_locally(local_json_path, filename, folder_path_or_id)
+
+        if success and summary and course_name and dest_label:
+            summary.add_file(
+                course_name,
+                dest_label,
+                filename,
+                "updated" if existing_metadata else "created",
+            )
+        return 1 if success else 0
+    finally:
+        if os.path.exists(local_json_path):
+            try:
+                os.remove(local_json_path)
+            except OSError:
+                pass
+
+
+def _get_bool_config(
+    config: configparser.ConfigParser,
+    section: str,
+    option: str,
+    default: bool,
+) -> bool:
+    if not config.has_section(section):
+        return default
+    try:
+        value = config.get(section, option, fallback=str(default)).strip().lower()
+        return value in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        return default
+
+
 def process_course_pages(
     course_id: int,
     course_name: str,
@@ -1541,6 +1681,666 @@ def process_course_pages(
     return 0
 
 
+def process_course_announcements(
+    course_id: int,
+    course_name: str,
+    reports_folder_path_or_id,
+    canvas_api_url: str,
+    canvas_headers: dict,
+    storage_type: str,
+    drive_service=None,
+    session: Optional[requests.Session] = None,
+    timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    per_page: int = DEFAULT_CANVAS_PER_PAGE,
+    summary: Optional[SummaryCollector] = None,
+):
+    if session is None:
+        session = requests.Session()
+
+    base_url = (canvas_api_url or "").rstrip("/")
+    announcements_url = (
+        f"{base_url}/api/v1/announcements?context_codes[]=course_{course_id}"
+    )
+    announcements = get_paginated_canvas_items(
+        announcements_url,
+        canvas_headers,
+        session,
+        timeout,
+        per_page,
+        suppress_errors=True,
+    )
+    if not announcements:
+        return 0
+
+    latest_ts = _max_timestamp_from_items(
+        announcements, ["posted_at", "last_reply_at", "updated_at"]
+    )
+    filename = "announcements.json"
+    if storage_type == "google_drive":
+        existing_metadata = get_existing_file_metadata_drive(
+            drive_service, reports_folder_path_or_id, filename
+        )
+    else:
+        existing_metadata = get_existing_file_metadata_local(
+            reports_folder_path_or_id, filename
+        )
+
+    if not _should_regenerate_resource(existing_metadata, latest_ts):
+        return 0
+
+    print(
+        f"{'Updating' if existing_metadata else 'New'} announcements for '{course_name}'"
+    )
+    reports_label = f"{course_name}/Reports"
+    return _export_json_resource(
+        announcements,
+        filename,
+        reports_folder_path_or_id,
+        storage_type,
+        drive_service,
+        existing_metadata,
+        summary,
+        course_name,
+        reports_label,
+    )
+
+
+def process_course_discussions(
+    course_id: int,
+    course_name: str,
+    reports_folder_path_or_id,
+    canvas_api_url: str,
+    canvas_headers: dict,
+    storage_type: str,
+    drive_service=None,
+    session: Optional[requests.Session] = None,
+    timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    per_page: int = DEFAULT_CANVAS_PER_PAGE,
+    summary: Optional[SummaryCollector] = None,
+):
+    if session is None:
+        session = requests.Session()
+
+    base_url = (canvas_api_url or "").rstrip("/")
+    discussions_url = f"{base_url}/api/v1/courses/{course_id}/discussion_topics"
+    discussions = get_paginated_canvas_items(
+        discussions_url,
+        canvas_headers,
+        session,
+        timeout,
+        per_page,
+        suppress_errors=True,
+    )
+    if not discussions:
+        return 0
+
+    latest_ts = _max_timestamp_from_items(
+        discussions, ["last_reply_at", "posted_at", "updated_at"]
+    )
+    filename = "discussion_topics.json"
+    if storage_type == "google_drive":
+        existing_metadata = get_existing_file_metadata_drive(
+            drive_service, reports_folder_path_or_id, filename
+        )
+    else:
+        existing_metadata = get_existing_file_metadata_local(
+            reports_folder_path_or_id, filename
+        )
+
+    if not _should_regenerate_resource(existing_metadata, latest_ts):
+        return 0
+
+    print(
+        f"{'Updating' if existing_metadata else 'New'} discussions for '{course_name}'"
+    )
+    reports_label = f"{course_name}/Reports"
+    return _export_json_resource(
+        discussions,
+        filename,
+        reports_folder_path_or_id,
+        storage_type,
+        drive_service,
+        existing_metadata,
+        summary,
+        course_name,
+        reports_label,
+    )
+
+
+def process_course_quizzes(
+    course_id: int,
+    course_name: str,
+    reports_folder_path_or_id,
+    canvas_api_url: str,
+    canvas_headers: dict,
+    storage_type: str,
+    drive_service=None,
+    session: Optional[requests.Session] = None,
+    timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    per_page: int = DEFAULT_CANVAS_PER_PAGE,
+    summary: Optional[SummaryCollector] = None,
+):
+    if session is None:
+        session = requests.Session()
+
+    base_url = (canvas_api_url or "").rstrip("/")
+    quizzes_url = f"{base_url}/api/v1/courses/{course_id}/quizzes"
+    quizzes = get_paginated_canvas_items(
+        quizzes_url,
+        canvas_headers,
+        session,
+        timeout,
+        per_page,
+        suppress_errors=True,
+    )
+    if not quizzes:
+        return 0
+
+    latest_ts = _max_timestamp_from_items(quizzes, ["updated_at", "published_at"])
+    filename = "quizzes.json"
+    if storage_type == "google_drive":
+        existing_metadata = get_existing_file_metadata_drive(
+            drive_service, reports_folder_path_or_id, filename
+        )
+    else:
+        existing_metadata = get_existing_file_metadata_local(
+            reports_folder_path_or_id, filename
+        )
+
+    if not _should_regenerate_resource(existing_metadata, latest_ts):
+        return 0
+
+    print(f"{'Updating' if existing_metadata else 'New'} quizzes for '{course_name}'")
+    reports_label = f"{course_name}/Reports"
+    return _export_json_resource(
+        quizzes,
+        filename,
+        reports_folder_path_or_id,
+        storage_type,
+        drive_service,
+        existing_metadata,
+        summary,
+        course_name,
+        reports_label,
+    )
+
+
+def process_course_enrollments(
+    course_id: int,
+    course_name: str,
+    reports_folder_path_or_id,
+    canvas_api_url: str,
+    canvas_headers: dict,
+    storage_type: str,
+    drive_service=None,
+    session: Optional[requests.Session] = None,
+    timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    per_page: int = DEFAULT_CANVAS_PER_PAGE,
+    summary: Optional[SummaryCollector] = None,
+):
+    if session is None:
+        session = requests.Session()
+
+    base_url = (canvas_api_url or "").rstrip("/")
+    enrollments_url = f"{base_url}/api/v1/courses/{course_id}/enrollments"
+    enrollments = get_paginated_canvas_items(
+        enrollments_url,
+        canvas_headers,
+        session,
+        timeout,
+        per_page,
+        suppress_errors=True,
+    )
+    if not enrollments:
+        return 0
+
+    latest_ts = _max_timestamp_from_items(
+        enrollments, ["updated_at", "last_activity_at", "created_at"]
+    )
+    filename = "enrollments.json"
+    if storage_type == "google_drive":
+        existing_metadata = get_existing_file_metadata_drive(
+            drive_service, reports_folder_path_or_id, filename
+        )
+    else:
+        existing_metadata = get_existing_file_metadata_local(
+            reports_folder_path_or_id, filename
+        )
+
+    if not _should_regenerate_resource(existing_metadata, latest_ts):
+        return 0
+
+    print(
+        f"{'Updating' if existing_metadata else 'New'} enrollments for '{course_name}'"
+    )
+    reports_label = f"{course_name}/Reports"
+    return _export_json_resource(
+        enrollments,
+        filename,
+        reports_folder_path_or_id,
+        storage_type,
+        drive_service,
+        existing_metadata,
+        summary,
+        course_name,
+        reports_label,
+    )
+
+
+def process_course_calendar_events(
+    course_id: int,
+    course_name: str,
+    reports_folder_path_or_id,
+    canvas_api_url: str,
+    canvas_headers: dict,
+    storage_type: str,
+    drive_service=None,
+    session: Optional[requests.Session] = None,
+    timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    per_page: int = DEFAULT_CANVAS_PER_PAGE,
+    summary: Optional[SummaryCollector] = None,
+):
+    if session is None:
+        session = requests.Session()
+
+    base_url = (canvas_api_url or "").rstrip("/")
+    calendar_url = (
+        f"{base_url}/api/v1/calendar_events?context_codes[]=course_{course_id}"
+    )
+    calendar_events = get_paginated_canvas_items(
+        calendar_url,
+        canvas_headers,
+        session,
+        timeout,
+        per_page,
+        suppress_errors=True,
+    )
+    if not calendar_events:
+        return 0
+
+    latest_ts = _max_timestamp_from_items(
+        calendar_events, ["updated_at", "start_at", "end_at"]
+    )
+    filename = "calendar_events.json"
+    if storage_type == "google_drive":
+        existing_metadata = get_existing_file_metadata_drive(
+            drive_service, reports_folder_path_or_id, filename
+        )
+    else:
+        existing_metadata = get_existing_file_metadata_local(
+            reports_folder_path_or_id, filename
+        )
+
+    if not _should_regenerate_resource(existing_metadata, latest_ts):
+        return 0
+
+    print(
+        f"{'Updating' if existing_metadata else 'New'} calendar events for '{course_name}'"
+    )
+    reports_label = f"{course_name}/Reports"
+    return _export_json_resource(
+        calendar_events,
+        filename,
+        reports_folder_path_or_id,
+        storage_type,
+        drive_service,
+        existing_metadata,
+        summary,
+        course_name,
+        reports_label,
+    )
+
+
+def process_course_groups(
+    course_id: int,
+    course_name: str,
+    reports_folder_path_or_id,
+    canvas_api_url: str,
+    canvas_headers: dict,
+    storage_type: str,
+    drive_service=None,
+    session: Optional[requests.Session] = None,
+    timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    per_page: int = DEFAULT_CANVAS_PER_PAGE,
+    summary: Optional[SummaryCollector] = None,
+):
+    if session is None:
+        session = requests.Session()
+
+    base_url = (canvas_api_url or "").rstrip("/")
+    groups_url = f"{base_url}/api/v1/courses/{course_id}/groups"
+    groups = get_paginated_canvas_items(
+        groups_url,
+        canvas_headers,
+        session,
+        timeout,
+        per_page,
+        suppress_errors=True,
+    )
+    if not groups:
+        return 0
+
+    latest_ts = _max_timestamp_from_items(groups, ["updated_at", "created_at"])
+    filename = "groups.json"
+    if storage_type == "google_drive":
+        existing_metadata = get_existing_file_metadata_drive(
+            drive_service, reports_folder_path_or_id, filename
+        )
+    else:
+        existing_metadata = get_existing_file_metadata_local(
+            reports_folder_path_or_id, filename
+        )
+
+    if not _should_regenerate_resource(existing_metadata, latest_ts):
+        return 0
+
+    print(f"{'Updating' if existing_metadata else 'New'} groups for '{course_name}'")
+    reports_label = f"{course_name}/Reports"
+    return _export_json_resource(
+        groups,
+        filename,
+        reports_folder_path_or_id,
+        storage_type,
+        drive_service,
+        existing_metadata,
+        summary,
+        course_name,
+        reports_label,
+    )
+
+
+def process_course_analytics_activity(
+    course_id: int,
+    course_name: str,
+    reports_folder_path_or_id,
+    canvas_api_url: str,
+    canvas_headers: dict,
+    storage_type: str,
+    drive_service=None,
+    session: Optional[requests.Session] = None,
+    timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    summary: Optional[SummaryCollector] = None,
+):
+    if session is None:
+        session = requests.Session()
+
+    base_url = (canvas_api_url or "").rstrip("/")
+    analytics_url = f"{base_url}/api/v1/courses/{course_id}/analytics/activity"
+    try:
+        resp = session.get(analytics_url, headers=canvas_headers, timeout=timeout)
+        resp.raise_for_status()
+        analytics_payload = resp.json()
+    except requests.RequestException as e:
+        print(f"Could not fetch analytics for course {course_id}: {e}")
+        return 0
+
+    if not analytics_payload:
+        return 0
+
+    combined_items: List[Dict] = []
+    if isinstance(analytics_payload, list):
+        combined_items = [i for i in analytics_payload if isinstance(i, dict)]
+    elif isinstance(analytics_payload, dict):
+        for value in analytics_payload.values():
+            if isinstance(value, list):
+                combined_items.extend([i for i in value if isinstance(i, dict)])
+
+    latest_ts = _max_timestamp_from_items(
+        combined_items, ["created_at", "updated_at", "last_activity_at"]
+    )
+    filename = "analytics_activity.json"
+    if storage_type == "google_drive":
+        existing_metadata = get_existing_file_metadata_drive(
+            drive_service, reports_folder_path_or_id, filename
+        )
+    else:
+        existing_metadata = get_existing_file_metadata_local(
+            reports_folder_path_or_id, filename
+        )
+
+    if not _should_regenerate_resource(existing_metadata, latest_ts):
+        return 0
+
+    print(
+        f"{'Updating' if existing_metadata else 'New'} analytics activity for '{course_name}'"
+    )
+    reports_label = f"{course_name}/Reports"
+    return _export_json_resource(
+        analytics_payload,
+        filename,
+        reports_folder_path_or_id,
+        storage_type,
+        drive_service,
+        existing_metadata,
+        summary,
+        course_name,
+        reports_label,
+    )
+
+
+def process_course_gradebook_history(
+    course_id: int,
+    course_name: str,
+    reports_folder_path_or_id,
+    canvas_api_url: str,
+    canvas_headers: dict,
+    storage_type: str,
+    drive_service=None,
+    session: Optional[requests.Session] = None,
+    timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    summary: Optional[SummaryCollector] = None,
+):
+    if session is None:
+        session = requests.Session()
+
+    base_url = (canvas_api_url or "").rstrip("/")
+    history_url = f"{base_url}/api/v1/courses/{course_id}/gradebook_history/feed"
+    try:
+        resp = session.get(history_url, headers=canvas_headers, timeout=timeout)
+        resp.raise_for_status()
+        history_payload = resp.json()
+    except requests.RequestException as e:
+        print(f"Could not fetch gradebook history for course {course_id}: {e}")
+        return 0
+
+    if not history_payload:
+        return 0
+
+    latest_ts = _max_timestamp_from_items(
+        history_payload, ["graded_at", "posted_at", "created_at", "updated_at"]
+    )
+    filename = "gradebook_history.json"
+    if storage_type == "google_drive":
+        existing_metadata = get_existing_file_metadata_drive(
+            drive_service, reports_folder_path_or_id, filename
+        )
+    else:
+        existing_metadata = get_existing_file_metadata_local(
+            reports_folder_path_or_id, filename
+        )
+
+    if not _should_regenerate_resource(existing_metadata, latest_ts):
+        return 0
+
+    print(
+        f"{'Updating' if existing_metadata else 'New'} gradebook history for '{course_name}'"
+    )
+    reports_label = f"{course_name}/Reports"
+    return _export_json_resource(
+        history_payload,
+        filename,
+        reports_folder_path_or_id,
+        storage_type,
+        drive_service,
+        existing_metadata,
+        summary,
+        course_name,
+        reports_label,
+    )
+
+
+def process_course_submissions_summary(
+    course_id: int,
+    course_name: str,
+    assignments: List[Dict],
+    reports_folder_path_or_id,
+    canvas_api_url: str,
+    canvas_headers: dict,
+    storage_type: str,
+    drive_service=None,
+    session: Optional[requests.Session] = None,
+    timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    per_page: int = DEFAULT_CANVAS_PER_PAGE,
+    summary: Optional[SummaryCollector] = None,
+):
+    if session is None:
+        session = requests.Session()
+
+    if not assignments:
+        return 0
+
+    base_url = (canvas_api_url or "").rstrip("/")
+    collected_submissions = []
+
+    for assignment in assignments:
+        assignment_id = assignment.get("id")
+        if not assignment_id:
+            continue
+        assignment_name = assignment.get("name")
+        submissions_url = f"{base_url}/api/v1/courses/{course_id}/assignments/{assignment_id}/submissions"
+        submissions = get_paginated_canvas_items(
+            submissions_url,
+            canvas_headers,
+            session,
+            timeout,
+            per_page,
+            suppress_errors=True,
+        )
+        for submission in submissions or []:
+            if not isinstance(submission, dict):
+                continue
+            collected_submissions.append(
+                {
+                    "assignment_id": assignment_id,
+                    "assignment_name": assignment_name,
+                    "id": submission.get("id"),
+                    "user_id": submission.get("user_id"),
+                    "submitted_at": submission.get("submitted_at"),
+                    "graded_at": submission.get("graded_at"),
+                    "posted_at": submission.get("posted_at"),
+                    "workflow_state": submission.get("workflow_state"),
+                    "score": submission.get("score"),
+                    "grade": submission.get("grade"),
+                    "attempt": submission.get("attempt"),
+                }
+            )
+
+    if not collected_submissions:
+        return 0
+
+    latest_ts = _max_timestamp_from_items(
+        collected_submissions, ["graded_at", "posted_at", "submitted_at"]
+    )
+    filename = "submissions_summary.json"
+    if storage_type == "google_drive":
+        existing_metadata = get_existing_file_metadata_drive(
+            drive_service, reports_folder_path_or_id, filename
+        )
+    else:
+        existing_metadata = get_existing_file_metadata_local(
+            reports_folder_path_or_id, filename
+        )
+
+    if not _should_regenerate_resource(existing_metadata, latest_ts):
+        return 0
+
+    print(
+        f"{'Updating' if existing_metadata else 'New'} submissions summary for '{course_name}'"
+    )
+    reports_label = f"{course_name}/Reports"
+    return _export_json_resource(
+        collected_submissions,
+        filename,
+        reports_folder_path_or_id,
+        storage_type,
+        drive_service,
+        existing_metadata,
+        summary,
+        course_name,
+        reports_label,
+    )
+
+
+def process_inbox_conversations(
+    root_storage_path_or_id,
+    canvas_api_url: str,
+    canvas_headers: dict,
+    storage_type: str,
+    drive_service=None,
+    session: Optional[requests.Session] = None,
+    timeout: int = DEFAULT_REQUEST_TIMEOUT,
+    per_page: int = DEFAULT_CANVAS_PER_PAGE,
+    summary: Optional[SummaryCollector] = None,
+):
+    """Fetch user inbox conversations (global, not course-specific)."""
+    if session is None:
+        session = requests.Session()
+
+    base_url = (canvas_api_url or "").rstrip("/")
+    conversations_url = f"{base_url}/api/v1/conversations"
+    conversations = get_paginated_canvas_items(
+        conversations_url,
+        canvas_headers,
+        session,
+        timeout,
+        per_page,
+        suppress_errors=True,
+    )
+    if not conversations:
+        return 0
+
+    latest_ts = _max_timestamp_from_items(
+        conversations, ["last_message_at", "updated_at"]
+    )
+    if storage_type == "google_drive":
+        conversations_folder = get_or_create_folder(
+            drive_service, "Conversations", parent_id=root_storage_path_or_id
+        )
+    else:
+        conversations_folder = get_or_create_local_folder(
+            root_storage_path_or_id, "Conversations"
+        )
+
+    if not conversations_folder:
+        return 0
+
+    filename = "conversations.json"
+    if storage_type == "google_drive":
+        existing_metadata = get_existing_file_metadata_drive(
+            drive_service, conversations_folder, filename
+        )
+    else:
+        existing_metadata = get_existing_file_metadata_local(
+            conversations_folder, filename
+        )
+
+    if not _should_regenerate_resource(existing_metadata, latest_ts):
+        return 0
+
+    print(f"{'Updating' if existing_metadata else 'New'} inbox conversations archive")
+    return _export_json_resource(
+        conversations,
+        filename,
+        conversations_folder,
+        storage_type,
+        drive_service,
+        existing_metadata,
+        summary,
+        "Inbox",
+        "Inbox/Conversations",
+    )
+
+
 def main():
     """Main function to run the sync process."""
     print("--- Starting Canvas to Storage Sync ---")
@@ -1622,7 +2422,32 @@ def main():
         http_pool_maxsize = DEFAULT_HTTP_POOL_MAXSIZE
         drive_chunk_size_mb = DEFAULT_DRIVE_CHUNK_SIZE_MB
 
+    # Export toggles
+    export_announcements = _get_bool_config(
+        config, "EXPORTS", "EXPORT_ANNOUNCEMENTS", True
+    )
+    export_discussions = _get_bool_config(config, "EXPORTS", "EXPORT_DISCUSSIONS", True)
+    export_quizzes = _get_bool_config(config, "EXPORTS", "EXPORT_QUIZZES", True)
+    export_enrollments = _get_bool_config(config, "EXPORTS", "EXPORT_ENROLLMENTS", True)
+    export_calendar_events = _get_bool_config(
+        config, "EXPORTS", "EXPORT_CALENDAR_EVENTS", True
+    )
+    export_groups = _get_bool_config(config, "EXPORTS", "EXPORT_GROUPS", True)
+    export_analytics = _get_bool_config(
+        config, "EXPORTS", "EXPORT_ANALYTICS_ACTIVITY", True
+    )
+    export_gradebook = _get_bool_config(
+        config, "EXPORTS", "EXPORT_GRADEBOOK_HISTORY", True
+    )
+    export_submissions = _get_bool_config(
+        config, "EXPORTS", "EXPORT_SUBMISSIONS_SUMMARY", False
+    )
+    export_inbox = _get_bool_config(
+        config, "EXPORTS", "EXPORT_INBOX_CONVERSATIONS", False
+    )
+
     # Shared HTTP session with retries and connection pooling
+
     session = requests.Session()
     retries = Retry(
         total=max_retries,
@@ -1677,9 +2502,31 @@ def main():
     print(f"\nSelected {len(selected_courses)} course(s) to sync.")
 
     for course in selected_courses:
+
         course_name, course_id = course.get("name", "Unnamed"), course.get("id")
 
         print(f"\n--- Processing Course: {course_name} ---")
+
+        # --- Process Quizzes ---
+        if export_quizzes:
+            print("Searching for quizzes...")
+            quizzes = get_canvas_quizzes(
+                course_id,
+                session,
+                canvas_api_url,
+                canvas_api_key,
+                timeout=request_timeout,
+                per_page=canvas_per_page,
+            )
+            if quizzes:
+                print(f"Found {len(quizzes)} quizzes in '{course_name}':")
+                for quiz in quizzes:
+                    title = quiz.get("title", "(untitled)")
+                    due_at = quiz.get("due_at", "N/A")
+                    points = quiz.get("points_possible", "N/A")
+                    print(f"  - {title} | Due: {due_at} | Points: {points}")
+            else:
+                print("No quizzes found.")
 
         if storage_type == "google_drive":
             course_storage_path = get_or_create_folder(
@@ -1690,6 +2537,16 @@ def main():
         else:  # local storage
             course_storage_path = get_or_create_local_folder(
                 local_root_dir, course_name
+            )
+
+        # Prepare per-course reports folder for aggregated exports
+        if storage_type == "google_drive":
+            reports_folder_path = get_or_create_folder(
+                drive_service, "Reports", parent_id=course_storage_path
+            )
+        else:
+            reports_folder_path = get_or_create_local_folder(
+                course_storage_path, "Reports"
             )
 
         processed_canvas_file_ids = set()
@@ -1964,12 +2821,194 @@ def main():
         except Exception as e:
             print(f"Error merging course pages for '{course_name}': {e}")
 
+        # --- Course-level reports and exports ---
+        if reports_folder_path:
+            if export_announcements:
+                try:
+                    new_items_synced += process_course_announcements(
+                        course_id,
+                        course_name,
+                        reports_folder_path,
+                        canvas_api_url,
+                        canvas_headers,
+                        storage_type,
+                        drive_service,
+                        session=session,
+                        timeout=request_timeout,
+                        per_page=canvas_per_page,
+                        summary=summary,
+                    )
+                except Exception as e:
+                    print(f"Error exporting announcements for '{course_name}': {e}")
+
+            if export_discussions:
+                try:
+                    new_items_synced += process_course_discussions(
+                        course_id,
+                        course_name,
+                        reports_folder_path,
+                        canvas_api_url,
+                        canvas_headers,
+                        storage_type,
+                        drive_service,
+                        session=session,
+                        timeout=request_timeout,
+                        per_page=canvas_per_page,
+                        summary=summary,
+                    )
+                except Exception as e:
+                    print(f"Error exporting discussions for '{course_name}': {e}")
+
+            if export_quizzes:
+                try:
+                    new_items_synced += process_course_quizzes(
+                        course_id,
+                        course_name,
+                        reports_folder_path,
+                        canvas_api_url,
+                        canvas_headers,
+                        storage_type,
+                        drive_service,
+                        session=session,
+                        timeout=request_timeout,
+                        per_page=canvas_per_page,
+                        summary=summary,
+                    )
+                except Exception as e:
+                    print(f"Error exporting quizzes for '{course_name}': {e}")
+
+            if export_enrollments:
+                try:
+                    new_items_synced += process_course_enrollments(
+                        course_id,
+                        course_name,
+                        reports_folder_path,
+                        canvas_api_url,
+                        canvas_headers,
+                        storage_type,
+                        drive_service,
+                        session=session,
+                        timeout=request_timeout,
+                        per_page=canvas_per_page,
+                        summary=summary,
+                    )
+                except Exception as e:
+                    print(f"Error exporting enrollments for '{course_name}': {e}")
+
+            if export_calendar_events:
+                try:
+                    new_items_synced += process_course_calendar_events(
+                        course_id,
+                        course_name,
+                        reports_folder_path,
+                        canvas_api_url,
+                        canvas_headers,
+                        storage_type,
+                        drive_service,
+                        session=session,
+                        timeout=request_timeout,
+                        per_page=canvas_per_page,
+                        summary=summary,
+                    )
+                except Exception as e:
+                    print(f"Error exporting calendar events for '{course_name}': {e}")
+
+            if export_groups:
+                try:
+                    new_items_synced += process_course_groups(
+                        course_id,
+                        course_name,
+                        reports_folder_path,
+                        canvas_api_url,
+                        canvas_headers,
+                        storage_type,
+                        drive_service,
+                        session=session,
+                        timeout=request_timeout,
+                        per_page=canvas_per_page,
+                        summary=summary,
+                    )
+                except Exception as e:
+                    print(f"Error exporting groups for '{course_name}': {e}")
+
+            if export_analytics:
+                try:
+                    new_items_synced += process_course_analytics_activity(
+                        course_id,
+                        course_name,
+                        reports_folder_path,
+                        canvas_api_url,
+                        canvas_headers,
+                        storage_type,
+                        drive_service,
+                        session=session,
+                        timeout=request_timeout,
+                        summary=summary,
+                    )
+                except Exception as e:
+                    print(f"Error exporting analytics for '{course_name}': {e}")
+
+            if export_gradebook:
+                try:
+                    new_items_synced += process_course_gradebook_history(
+                        course_id,
+                        course_name,
+                        reports_folder_path,
+                        canvas_api_url,
+                        canvas_headers,
+                        storage_type,
+                        drive_service,
+                        session=session,
+                        timeout=request_timeout,
+                        summary=summary,
+                    )
+                except Exception as e:
+                    print(f"Error exporting gradebook history for '{course_name}': {e}")
+
+            if export_submissions:
+                try:
+                    new_items_synced += process_course_submissions_summary(
+                        course_id,
+                        course_name,
+                        assignments or [],
+                        reports_folder_path,
+                        canvas_api_url,
+                        canvas_headers,
+                        storage_type,
+                        drive_service,
+                        session=session,
+                        timeout=request_timeout,
+                        per_page=canvas_per_page,
+                        summary=summary,
+                    )
+                except Exception as e:
+                    print(f"Error exporting submissions for '{course_name}': {e}")
+
         if new_items_synced == 0:
             print(
-                "All discoverable files, pages, and assignments for this course are already up to date."
+                "All discoverable files, pages, assignments, and reports for this course are already up to date."
             )
         else:
             print(f"Synced/updated {new_items_synced} item(s) for '{course_name}'.")
+
+    # Global (user-level) inbox conversations archive
+    if export_inbox:
+        try:
+            inbox_changes = process_inbox_conversations(
+                root_storage_path,
+                canvas_api_url,
+                canvas_headers,
+                storage_type,
+                drive_service,
+                session=session,
+                timeout=request_timeout,
+                per_page=canvas_per_page,
+                summary=summary,
+            )
+            if inbox_changes:
+                print(f"Archived {inbox_changes} inbox conversation export(s).")
+        except Exception as e:
+            print(f"Error exporting inbox conversations: {e}")
 
     # Print summary before cleanup
     summary.print_summary()

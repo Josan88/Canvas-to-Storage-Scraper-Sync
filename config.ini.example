@@ -34,3 +34,26 @@ CANVAS_PER_PAGE = 100
 HTTP_POOL_MAXSIZE = 20
 # Google Drive upload chunk size in MB (resumable upload)
 DRIVE_CHUNK_SIZE_MB = 8
+
+[EXPORTS]
+# Toggle optional exports (true/false). Defaults: most ON, heavy ones OFF.
+# Course announcements → Reports/announcements.json
+EXPORT_ANNOUNCEMENTS = true
+# Discussion topics → Reports/discussion_topics.json
+EXPORT_DISCUSSIONS = true
+# Course quizzes (classic) → Reports/quizzes.json
+EXPORT_QUIZZES = true
+# Course enrollments → Reports/enrollments.json
+EXPORT_ENROLLMENTS = true
+# Course calendar events → Reports/calendar_events.json
+EXPORT_CALENDAR_EVENTS = true
+# Course groups → Reports/groups.json
+EXPORT_GROUPS = true
+# Course analytics activity → Reports/analytics_activity.json
+EXPORT_ANALYTICS_ACTIVITY = true
+# Gradebook history feed → Reports/gradebook_history.json
+EXPORT_GRADEBOOK_HISTORY = true
+# Potentially heavy: pulls all submissions metadata (not files) → Reports/submissions_summary.json
+EXPORT_SUBMISSIONS_SUMMARY = false
+# Global inbox conversations (not per-course); can be large → Conversations/conversations.json
+EXPORT_INBOX_CONVERSATIONS = false
